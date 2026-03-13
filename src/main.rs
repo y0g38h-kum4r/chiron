@@ -87,10 +87,6 @@ fn main() {
         println!("  ... and {} more", result.entries.len() - 5);
     }
 
-    // --- Algo signal: mark an incident window ---
-    println!("\n--- Setting algo signal: incident at t=350, score=0.9, TTL=50s ---");
-    store.set_algo_signal(350, 0.9, 50.0, 4.0);
-
     // --- Tick: maintenance cycle ---
     println!("Running maintenance tick...");
     store.tick(5.0);

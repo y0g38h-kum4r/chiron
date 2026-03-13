@@ -122,16 +122,6 @@ impl ChironStore {
         })
     }
 
-    /// Set an algorithm signal for a specific timestamp (incident detection).
-    pub fn set_algo_signal(&mut self, timestamp: i64, score: f64, ttl: f64, now: f64) {
-        if let Some(vnode_idx) = self.ring.find_vnode(timestamp) {
-            let shard = self.ring.shard_for_vnode_mut(vnode_idx);
-            shard
-                .window_meta
-                .set_algo_signal(timestamp, score, ttl, now);
-        }
-    }
-
     /// Periodic maintenance: update query rates, detect hot cores, trigger splits.
     pub fn tick(&mut self, now: f64) {
         // Update query rates.
