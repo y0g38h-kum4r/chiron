@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::fs;
-use std::io::{self, Read};
+use std::fs::{self, File};
+use std::io::{self, Read, Write};
 use std::path::Path;
 
 use crate::log_entry::LogEntry;
@@ -83,9 +83,16 @@ impl Snapshot {
             }
         }
 
-        // Write to tmp file, then atomic rename.
-        fs::write(&tmp_path, &buf)?;
+        // Write the temp file durably before rename so power loss does not
+        // leave us with a renamed but not-yet-persisted snapshot payload.
+        let mut tmp_file = File::create(&tmp_path)?;
+        tmp_file.write_all(&buf)?;
+        tmp_file.sync_all()?;
+        drop(tmp_file);
+
         fs::rename(&tmp_path, path)?;
+
+        sync_parent_dir(path)?;
 
         Ok(())
     }
@@ -196,6 +203,11 @@ fn read_entry(cursor: &mut &[u8]) -> io::Result<LogEntry> {
         message,
         severity: sev[0],
     })
+}
+
+fn sync_parent_dir(path: &Path) -> io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    File::open(parent)?.sync_all()
 }
 
 #[cfg(test)]

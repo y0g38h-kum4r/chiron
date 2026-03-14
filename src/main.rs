@@ -40,7 +40,7 @@ fn main() {
 
     // --- Run the concurrent pipeline ---
     println!("Starting pipeline (ensure Kafka is running: docker compose up -d)...");
-    let (store, stats) = run_pipeline(config);
+    let (store, stats) = run_pipeline(config).expect("pipeline run failed");
 
     println!("Pipeline complete!");
     println!(
@@ -50,6 +50,11 @@ fn main() {
     println!(
         "  Consumed: {} entries in {:?}",
         stats.total_consumed, stats.consume_duration
+    );
+    println!("  End-to-end pipeline time: {:?}", stats.pipeline_duration);
+    println!(
+        "  Background index flushes: {}, max observed lag: {}",
+        stats.index_flushes, stats.max_indexer_lag
     );
     println!();
 
