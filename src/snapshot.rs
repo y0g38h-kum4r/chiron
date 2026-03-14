@@ -4,7 +4,6 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 
 use crate::log_entry::LogEntry;
-use crate::ring_buffer::RingBuffer;
 
 /// Kafka consumer offsets at the time of snapshot.
 /// Maps (topic, partition) → offset.
@@ -40,7 +39,6 @@ impl KafkaOffsets {
 
 // --- Binary serialization (no external deps) ---
 
-const SNAPSHOT_MAGIC: &[u8; 8] = b"CHIRON01";
 const SHARDED_SNAPSHOT_MAGIC: &[u8; 8] = b"CHIRON03";
 
 pub struct SnapshotShard {
@@ -60,49 +58,6 @@ pub struct RestoredShard {
 pub struct Snapshot;
 
 impl Snapshot {
-    /// Save ring buffer + kafka offsets to disk.
-    /// Uses atomic write: write to .tmp, then rename.
-    pub fn save(
-        path: &Path,
-        ring_buffer: &RingBuffer,
-        kafka_offsets: &KafkaOffsets,
-    ) -> io::Result<()> {
-        let mut buf: Vec<u8> = Vec::new();
-
-        // Header
-        buf.extend_from_slice(SNAPSHOT_MAGIC);
-
-        // Ring buffer metadata
-        write_ring_buffer(&mut buf, ring_buffer);
-        write_kafka_offsets(&mut buf, kafka_offsets);
-
-        durable_replace(path, &buf)
-    }
-
-    /// Load ring buffer + kafka offsets from a snapshot file.
-    /// Returns (RingBuffer, KafkaOffsets).
-    /// The caller should rebuild indexes from the ring buffer via flush_indexer().
-    pub fn load(path: &Path) -> io::Result<(RingBuffer, KafkaOffsets)> {
-        let data = fs::read(path)?;
-        let mut cursor = &data[..];
-
-        // Header
-        let mut magic = [0u8; 8];
-        cursor.read_exact(&mut magic)?;
-        if &magic != SNAPSHOT_MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid snapshot magic",
-            ));
-        }
-
-        // Ring buffer metadata
-        let rb = read_ring_buffer(&mut cursor)?;
-        let kafka_offsets = read_kafka_offsets(&mut cursor)?;
-
-        Ok((rb, kafka_offsets))
-    }
-
     pub fn save_sharded(
         path: &Path,
         total_capacity: usize,
@@ -201,18 +156,6 @@ fn write_entry(buf: &mut Vec<u8>, entry: &LogEntry) {
     buf.push(entry.severity);
 }
 
-fn write_ring_buffer(buf: &mut Vec<u8>, ring_buffer: &RingBuffer) {
-    write_u64(buf, ring_buffer.capacity() as u64);
-    write_u64(buf, ring_buffer.next_offset());
-    write_u64(buf, ring_buffer.len() as u64);
-
-    let entries: Vec<_> = ring_buffer.iter().collect();
-    write_u64(buf, entries.len() as u64);
-    for (_offset, entry) in &entries {
-        write_entry(buf, entry);
-    }
-}
-
 fn write_kafka_offsets(buf: &mut Vec<u8>, kafka_offsets: &KafkaOffsets) {
     write_u32(buf, kafka_offsets.offsets.len() as u32);
     for (topic, partitions) in &kafka_offsets.offsets {
@@ -261,20 +204,6 @@ fn read_entry(cursor: &mut &[u8]) -> io::Result<LogEntry> {
     })
 }
 
-fn read_ring_buffer(cursor: &mut &[u8]) -> io::Result<RingBuffer> {
-    let capacity = read_u64(cursor)? as usize;
-    let global_offset = read_u64(cursor)?;
-    let len = read_u64(cursor)? as usize;
-
-    let entry_count = read_u64(cursor)? as usize;
-    let mut entries = Vec::with_capacity(entry_count);
-    for _ in 0..entry_count {
-        entries.push(read_entry(cursor)?);
-    }
-
-    RingBuffer::try_restore(capacity, global_offset, len, entries)
-}
-
 fn read_kafka_offsets(cursor: &mut &[u8]) -> io::Result<KafkaOffsets> {
     let topic_count = read_u32(cursor)? as usize;
     let mut kafka_offsets = KafkaOffsets::new();
@@ -298,6 +227,7 @@ fn sync_parent_dir(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     fn make_entry(ts: i64, svc: &str, host: &str) -> LogEntry {
         LogEntry {
             timestamp: ts,
@@ -309,77 +239,53 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_snapshot() {
-        let dir = std::env::temp_dir().join("chiron_test_snapshot");
+    fn sharded_snapshot_roundtrip() {
+        let dir = std::env::temp_dir().join("chiron_test_sharded_snapshot");
         fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("test.snap");
+        let path = dir.join("sharded.snap");
 
-        // Build ring buffer with some data.
-        let mut rb = RingBuffer::new(100);
-        rb.push(make_entry(100, "auth", "h1"));
-        rb.push(make_entry(200, "payment", "h2"));
-        rb.push(make_entry(300, "auth", "h3"));
+        let shards = vec![
+            SnapshotShard {
+                shard_id: 0,
+                next_offset: 3,
+                entries: vec![
+                    make_entry(100, "auth", "h0"),
+                    make_entry(200, "auth", "h0"),
+                    make_entry(300, "payment", "h0"),
+                ],
+            },
+            SnapshotShard {
+                shard_id: 1,
+                next_offset: 2,
+                entries: vec![
+                    make_entry(150, "auth", "h1"),
+                    make_entry(250, "payment", "h1"),
+                ],
+            },
+        ];
 
-        // Build kafka offsets.
         let mut offsets = KafkaOffsets::new();
         offsets.set("logs", 0, 45230);
         offsets.set("logs", 1, 38901);
-        offsets.set("metrics", 0, 12000);
 
-        // Save.
-        Snapshot::save(&path, &rb, &offsets).unwrap();
+        Snapshot::save_sharded(&path, 500, &shards, &offsets).unwrap();
 
-        // Load.
-        let (rb_loaded, offsets_loaded) = Snapshot::load(&path).unwrap();
+        let (capacity, restored, offsets_loaded) = Snapshot::load_sharded(&path).unwrap();
 
-        // Verify ring buffer.
-        assert_eq!(rb_loaded.capacity(), 100);
-        assert_eq!(rb_loaded.len(), 3);
-        assert_eq!(rb_loaded.next_offset(), rb.next_offset());
-        assert_eq!(rb_loaded.get(0).unwrap().timestamp, 100);
-        assert_eq!(rb_loaded.get(1).unwrap().service_name, "payment");
-        assert_eq!(rb_loaded.get(2).unwrap().host_id, "h3");
+        assert_eq!(capacity, 500);
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored[0].shard_id, 0);
+        assert_eq!(restored[0].entries.len(), 3);
+        assert_eq!(restored[0].next_offset, 3);
+        assert_eq!(restored[0].entries[0].timestamp, 100);
+        assert_eq!(restored[1].shard_id, 1);
+        assert_eq!(restored[1].entries.len(), 2);
+        assert_eq!(restored[1].next_offset, 2);
+        assert_eq!(restored[1].entries[0].service_name, "auth");
 
-        // Verify kafka offsets.
         assert_eq!(offsets_loaded.get("logs", 0), Some(45230));
         assert_eq!(offsets_loaded.get("logs", 1), Some(38901));
-        assert_eq!(offsets_loaded.get("metrics", 0), Some(12000));
-        assert_eq!(offsets_loaded.get("metrics", 1), None);
-
-        // Cleanup.
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn snapshot_with_wrapped_ring_buffer() {
-        let dir = std::env::temp_dir().join("chiron_test_snapshot_wrap");
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("wrapped.snap");
-
-        // Capacity 3, push 5 entries → wraps around, oldest 2 evicted.
-        let mut rb = RingBuffer::new(3);
-        rb.push(make_entry(1, "a", "h1")); // offset 0 — will be evicted
-        rb.push(make_entry(2, "b", "h1")); // offset 1 — will be evicted
-        rb.push(make_entry(3, "c", "h1")); // offset 2
-        rb.push(make_entry(4, "d", "h1")); // offset 3
-        rb.push(make_entry(5, "e", "h1")); // offset 4
-
-        assert_eq!(rb.len(), 3);
-        assert!(rb.get(0).is_none()); // evicted
-        assert_eq!(rb.get(2).unwrap().timestamp, 3);
-
-        let offsets = KafkaOffsets::new();
-        Snapshot::save(&path, &rb, &offsets).unwrap();
-        let (rb_loaded, _) = Snapshot::load(&path).unwrap();
-
-        assert_eq!(rb_loaded.len(), 3);
-        assert_eq!(rb_loaded.capacity(), 3);
-        assert_eq!(rb_loaded.next_offset(), 5);
-        assert!(rb_loaded.get(0).is_none());
-        assert!(rb_loaded.get(1).is_none());
-        assert_eq!(rb_loaded.get(2).unwrap().timestamp, 3);
-        assert_eq!(rb_loaded.get(3).unwrap().timestamp, 4);
-        assert_eq!(rb_loaded.get(4).unwrap().timestamp, 5);
+        assert_eq!(offsets_loaded.get("logs", 2), None);
 
         fs::remove_dir_all(&dir).ok();
     }
