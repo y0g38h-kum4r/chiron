@@ -1,6 +1,10 @@
+use std::io;
+use std::path::Path;
+
 use crate::inverted_index::InvertedIndex;
 use crate::log_entry::LogEntry;
 use crate::ring_buffer::RingBuffer;
+use crate::snapshot::{KafkaOffsets, Snapshot};
 
 /// Unified ChironStore: shared append-only log with async indexing.
 ///
@@ -168,6 +172,38 @@ impl ChironStore {
     pub fn capacity(&self) -> usize {
         self.ring_buffer.capacity()
     }
+
+    // --- Snapshot / Restore ---
+
+    /// Take a snapshot of the current ring buffer + kafka offsets to disk.
+    /// Writes atomically (tmp file + rename). Indexes are NOT included —
+    /// they are rebuilt from the ring buffer on restore via flush_indexer().
+    pub fn save_snapshot(
+        &self,
+        path: &Path,
+        kafka_offsets: &KafkaOffsets,
+    ) -> io::Result<()> {
+        Snapshot::save(path, &self.ring_buffer, kafka_offsets)
+    }
+
+    /// Restore from a snapshot file. Returns (ChironStore, KafkaOffsets).
+    /// The store's indexes are fully rebuilt from the ring buffer data.
+    /// Resume Kafka consumers from the returned offsets.
+    pub fn from_snapshot(path: &Path) -> io::Result<(Self, KafkaOffsets)> {
+        let (ring_buffer, kafka_offsets) = Snapshot::load(path)?;
+
+        let mut store = Self {
+            ring_buffer,
+            indexer_pos: 0,
+            service_index: InvertedIndex::new(),
+            host_index: InvertedIndex::new(),
+        };
+
+        // Rebuild indexes from restored ring buffer.
+        store.flush_indexer();
+
+        Ok((store, kafka_offsets))
+    }
 }
 
 #[cfg(test)]
@@ -266,5 +302,46 @@ mod tests {
 
         let result = store.query_by_service("svc", 0, 100);
         assert_eq!(result.entries.len(), 100);
+    }
+
+    #[test]
+    fn snapshot_and_restore() {
+        let dir = std::env::temp_dir().join("chiron_test_store_snapshot");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store.snap");
+
+        // Build store, ingest, flush.
+        let mut store = ChironStore::new(1000);
+        store.ingest(make_entry(10, "auth", "h1"));
+        store.ingest(make_entry(20, "payment", "h2"));
+        store.ingest(make_entry(30, "auth", "h1"));
+        store.flush_indexer();
+
+        // Set kafka offsets.
+        let mut offsets = KafkaOffsets::new();
+        offsets.set("logs", 0, 99999);
+        offsets.set("logs", 1, 88888);
+
+        // Save snapshot.
+        store.save_snapshot(&path, &offsets).unwrap();
+
+        // Restore from snapshot.
+        let (restored, restored_offsets) = ChironStore::from_snapshot(&path).unwrap();
+
+        // Indexes should be rebuilt — queries should work immediately.
+        let result = restored.query_by_service("auth", 0, 100);
+        assert_eq!(result.entries.len(), 2);
+
+        let result = restored.query_by_host("h1", 0, 100);
+        assert_eq!(result.entries.len(), 2);
+
+        let result = restored.query_by_service_and_host("auth", "h1", 0, 100);
+        assert_eq!(result.entries.len(), 2);
+
+        // Kafka offsets restored.
+        assert_eq!(restored_offsets.get("logs", 0), Some(99999));
+        assert_eq!(restored_offsets.get("logs", 1), Some(88888));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

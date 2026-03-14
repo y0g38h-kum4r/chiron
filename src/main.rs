@@ -1,82 +1,143 @@
+use std::path::Path;
+
 use chiron::chiron::ChironStore;
-use chiron::log_entry::LogEntry;
+use chiron::pipeline::{run_pipeline, PipelineConfig};
 
 fn main() {
-    println!("=== ChironVision Log Buffer Demo ===\n");
+    println!("=== ChironVision Log Buffer — Real Kafka Pipeline Demo ===\n");
 
-    let mut store = ChironStore::new(50_000);
+    // --- Configure the pipeline ---
+    let services: Vec<String> = vec![
+        "AuthService",
+        "PaymentService",
+        "OrderService",
+        "NotifService",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
 
-    let services = ["AuthService", "PaymentService", "OrderService", "NotifService"];
-    let hosts = ["host-0", "host-1", "host-2", "host-3", "host-4"];
+    let hosts: Vec<String> = (0..5).map(|i| format!("host-{}", i)).collect();
 
-    // --- Ingest ---
-    println!("Ingesting 5000 log entries...");
-    for i in 0..5000 {
-        let ts = i % 1000;
-        store.ingest(LogEntry {
-            timestamp: ts,
-            service_name: services[i as usize % services.len()].to_string(),
-            host_id: hosts[i as usize % hosts.len()].to_string(),
-            message: format!("event-{}", i),
-            severity: (i % 5) as u8,
-        });
-    }
-    println!("Ingestion complete. Indexer lag: {}\n", store.indexer_lag());
+    let logs_per_producer = 500;
+    let num_producers = services.len() * hosts.len();
+    let total_expected = num_producers as u64 * logs_per_producer;
 
-    // --- Flush indexer (in production, this runs on a dedicated thread) ---
-    store.flush_indexer();
-    println!("Indexer flushed. Lag: {}\n", store.indexer_lag());
+    let config = PipelineConfig::local(services.clone(), hosts.clone(), logs_per_producer);
 
-    // --- Query (a): service in time range ---
-    println!("--- Query (a): AuthService logs in [100, 200] ---");
-    let result = store.query_by_service("AuthService", 100, 200);
-    println!("  Found {} entries", result.entries.len());
-    for entry in result.entries.iter().take(5) {
-        println!(
-            "  [t={}] {} ({}): {}",
-            entry.timestamp, entry.service_name, entry.host_id, entry.message
-        );
-    }
-    if result.entries.len() > 5 {
-        println!("  ... and {} more", result.entries.len() - 5);
-    }
+    println!("Configuration:");
+    println!("  Brokers:           {}", config.brokers);
+    println!("  Topic:             {}", config.topic);
+    println!("  Services:          {:?}", config.services);
+    println!("  Hosts:             {:?}", config.hosts);
+    println!("  Kafka partitions:  {}", config.num_partitions);
+    println!("  Consumer group:    {}", config.consumer_group);
+    println!("  Producers:         {} (one per service×host)", num_producers);
+    println!("  Logs per producer: {}", logs_per_producer);
+    println!("  Total expected:    {}", total_expected);
+    println!();
 
-    // --- Query (b): host in time range ---
-    println!("\n--- Query (b): host-1 logs in [200, 400] ---");
-    let result = store.query_by_host("host-1", 200, 400);
-    println!("  Found {} entries", result.entries.len());
-    for entry in result.entries.iter().take(5) {
-        println!(
-            "  [t={}] {} ({}): {}",
-            entry.timestamp, entry.service_name, entry.host_id, entry.message
-        );
-    }
-    if result.entries.len() > 5 {
-        println!("  ... and {} more", result.entries.len() - 5);
-    }
+    // --- Run the concurrent pipeline ---
+    println!("Starting pipeline (ensure Kafka is running: docker compose up -d)...");
+    let (store, stats) = run_pipeline(config);
 
-    // --- Query (c): service + host in time range ---
-    println!("\n--- Query (c): AuthService on host-0 in [100, 300] ---");
-    let result = store.query_by_service_and_host("AuthService", "host-0", 100, 300);
-    println!("  Found {} entries", result.entries.len());
-    for entry in result.entries.iter().take(5) {
-        println!(
-            "  [t={}] {} ({}): {}",
-            entry.timestamp, entry.service_name, entry.host_id, entry.message
-        );
-    }
-    if result.entries.len() > 5 {
-        println!("  ... and {} more", result.entries.len() - 5);
-    }
-
-    // --- Maintenance tick ---
-    println!("\nRunning maintenance tick...");
-    store.tick();
+    println!("Pipeline complete!");
     println!(
-        "  Buffer: {}/{} entries",
-        store.len(),
-        store.capacity()
+        "  Produced: {} entries in {:?}",
+        stats.total_produced, stats.produce_duration
     );
+    println!(
+        "  Consumed: {} entries in {:?}",
+        stats.total_consumed, stats.consume_duration
+    );
+    println!();
+
+    // --- Show Kafka consumer offsets ---
+    println!("Kafka consumer offsets:");
+    for p in 0..4 {
+        let off = stats.kafka_offsets.get("chiron-logs", p).unwrap_or(0);
+        println!("  chiron-logs/partition-{}: offset {}", p, off);
+    }
+    println!();
+
+    // --- Query the store ---
+    {
+        let s = store.lock().unwrap();
+        println!(
+            "Buffer: {}/{} entries, indexer lag: {}\n",
+            s.len(),
+            s.capacity(),
+            s.indexer_lag()
+        );
+
+        // Query (a): by service
+        println!("--- Query (a): AuthService logs ---");
+        let result = s.query_by_service("AuthService", 0, i64::MAX);
+        println!("  Found {} entries", result.entries.len());
+        for entry in result.entries.iter().take(3) {
+            println!(
+                "  [t={}] {} ({}): {}",
+                entry.timestamp, entry.service_name, entry.host_id, entry.message
+            );
+        }
+        if result.entries.len() > 3 {
+            println!("  ... and {} more", result.entries.len() - 3);
+        }
+
+        // Query (b): by host
+        println!("\n--- Query (b): host-2 logs ---");
+        let result = s.query_by_host("host-2", 0, i64::MAX);
+        println!("  Found {} entries", result.entries.len());
+        for entry in result.entries.iter().take(3) {
+            println!(
+                "  [t={}] {} ({}): {}",
+                entry.timestamp, entry.service_name, entry.host_id, entry.message
+            );
+        }
+        if result.entries.len() > 3 {
+            println!("  ... and {} more", result.entries.len() - 3);
+        }
+
+        // Query (c): by service + host
+        println!("\n--- Query (c): AuthService on host-0 ---");
+        let result = s.query_by_service_and_host("AuthService", "host-0", 0, i64::MAX);
+        println!("  Found {} entries", result.entries.len());
+        for entry in result.entries.iter().take(3) {
+            println!(
+                "  [t={}] {} ({}): {}",
+                entry.timestamp, entry.service_name, entry.host_id, entry.message
+            );
+        }
+        if result.entries.len() > 3 {
+            println!("  ... and {} more", result.entries.len() - 3);
+        }
+    }
+
+    // --- Snapshot with kafka offsets ---
+    let snap_path = Path::new("/tmp/chiron_pipeline.snap");
+    println!("\n--- Snapshot ---");
+    {
+        let s = store.lock().unwrap();
+        s.save_snapshot(snap_path, &stats.kafka_offsets).unwrap();
+    }
+    println!("  Saved to {:?}", snap_path);
+
+    // Restore and verify
+    let (restored, restored_offsets) = ChironStore::from_snapshot(snap_path).unwrap();
+    let result = restored.query_by_service("AuthService", 0, i64::MAX);
+    println!(
+        "  Restored: {}/{} entries, AuthService query: {} results",
+        restored.len(),
+        restored.capacity(),
+        result.entries.len()
+    );
+    println!(
+        "  Kafka offsets restored: chiron-logs/0={}, chiron-logs/1={}",
+        restored_offsets.get("chiron-logs", 0).unwrap_or(0),
+        restored_offsets.get("chiron-logs", 1).unwrap_or(0),
+    );
+
+    std::fs::remove_file(snap_path).ok();
 
     println!("\n=== Demo complete ===");
 }

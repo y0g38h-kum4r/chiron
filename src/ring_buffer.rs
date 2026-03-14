@@ -85,6 +85,39 @@ impl RingBuffer {
         self.global_offset
     }
 
+    /// Restore a ring buffer from a snapshot.
+    /// `entries` must be in order oldest→newest, and there must be exactly `len` of them.
+    pub fn restore(
+        capacity: usize,
+        global_offset: u64,
+        len: usize,
+        entries: Vec<LogEntry>,
+    ) -> Self {
+        assert!(entries.len() == len, "entry count must match len");
+        assert!(len <= capacity, "len must not exceed capacity");
+
+        let mut buf = Vec::with_capacity(capacity);
+        buf.resize_with(capacity, || None);
+
+        // The oldest entry has global offset = global_offset - len.
+        // Place each entry at its correct ring position.
+        let oldest = global_offset - len as u64;
+        for (i, entry) in entries.into_iter().enumerate() {
+            let ring_idx = ((oldest + i as u64) % capacity as u64) as usize;
+            buf[ring_idx] = Some(entry);
+        }
+
+        let write_pos = (global_offset % capacity as u64) as usize;
+
+        Self {
+            buf,
+            capacity,
+            write_pos,
+            len,
+            global_offset,
+        }
+    }
+
     /// Iterate over all live entries in order (oldest to newest).
     pub fn iter(&self) -> RingBufferIter<'_> {
         RingBufferIter {

@@ -68,16 +68,73 @@ ByServiceAndHost("auth","h1",t1,t2) → intersect(service, host) → offsets →
 
 With monotonically increasing timestamps, eviction is simply **head eviction** — drop the oldest entries first. No scoring, no decay functions, no ordering structures needed. The ring buffer naturally overwrites from the head when full.
 
+## Durability: Hourly Snapshots + Kafka Replay
+
+The in-memory ring buffer is volatile. Durability is achieved via periodic checkpointing combined with Kafka replay:
+
+```
+Normal operation:
+
+  Kafka ──► Consumer threads ──► RingBuffer ──► Indexer ──► Indexes
+                 │
+                 tracks consumer offsets per topic/partition
+
+Every hour:
+
+  1. Pause consumers
+  2. Snapshot = ring buffer entries + Kafka consumer offsets
+  3. Write to disk (atomic: write to .tmp, then rename)
+  4. Resume consumers
+```
+
+### Recovery after crash
+
+```
+1. Load latest snapshot from disk
+   → ring buffer restored to hour-ago state
+   → Kafka consumer offsets restored
+
+2. Resume Kafka consumers from recorded offsets
+   → replays the last ≤1 hour of logs
+   → ring buffer catches up to present
+
+3. Indexes are rebuilt from the ring buffer automatically
+   → flush_indexer() over the full buffer
+   → queries work immediately
+```
+
+### Key invariants
+
+- **Zero data loss**: Kafka retains the full stream. The snapshot saves replay time, not data.
+- **Atomic writes**: snapshot is written to a `.tmp` file first, then atomically renamed. A crash mid-write leaves the previous good snapshot intact.
+- **Indexes are not snapshotted**: they are rebuilt from the ring buffer on restore. Re-indexing 1M entries takes milliseconds.
+- **Kafka retention must exceed snapshot interval**: if you snapshot every hour, Kafka must retain at least 2 hours (safety margin).
+
+### Snapshot format
+
+```
+┌─────────────────────────────────┐
+│ magic "CHIRON01"        8 bytes │
+│ ring buffer capacity    8 bytes │
+│ global_offset           8 bytes │
+│ entry count             8 bytes │
+│ entries[]           variable    │
+│ kafka topic count       4 bytes │
+│ kafka offsets[]     variable    │
+└─────────────────────────────────┘
+```
+
 ## File Structure
 
 ```
 src/
 ├── lib.rs               # Module declarations
-├── main.rs              # Demo
+├── main.rs              # Demo (ingest, query, snapshot/restore)
 ├── log_entry.rs         # LogEntry struct
 ├── ring_buffer.rs       # Shared append-only circular buffer
 ├── inverted_index.rs    # Per-dimension offset indexes (service, host)
-└── chiron.rs            # ChironStore: shared log + indexer + head eviction
+├── snapshot.rs          # Binary snapshot serialization + KafkaOffsets
+└── chiron.rs            # ChironStore: shared log + indexer + eviction + snapshots
 ```
 
 ## Usage
