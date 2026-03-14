@@ -29,32 +29,6 @@ pub struct QueryResult {
     pub entries: Vec<LogEntry>,
 }
 
-/// Intersect two sorted offset slices from different indexes.
-fn intersect_sorted(a: Option<&[u64]>, b: Option<&[u64]>) -> Vec<u64> {
-    let a = match a {
-        Some(v) => v,
-        None => return vec![],
-    };
-    let b = match b {
-        Some(v) => v,
-        None => return vec![],
-    };
-    let mut result = Vec::new();
-    let (mut i, mut j) = (0, 0);
-    while i < a.len() && j < b.len() {
-        if a[i] == b[j] {
-            result.push(a[i]);
-            i += 1;
-            j += 1;
-        } else if a[i] < b[j] {
-            i += 1;
-        } else {
-            j += 1;
-        }
-    }
-    result
-}
-
 impl ChironStore {
     pub fn new(capacity: usize) -> Self {
         Self {
@@ -116,12 +90,35 @@ impl ChironStore {
         t1: i64,
         t2: i64,
     ) -> QueryResult {
-        let svc_offsets = self.service_index.get(service);
-        let host_offsets = self.host_index.get(host);
-        let intersected = intersect_sorted(svc_offsets, host_offsets);
-        QueryResult {
-            entries: self.collect_entries(Some(&intersected), t1, t2),
+        let Some(svc_offsets) = self.service_index.get(service) else {
+            return QueryResult { entries: vec![] };
+        };
+        let Some(host_offsets) = self.host_index.get(host) else {
+            return QueryResult { entries: vec![] };
+        };
+
+        let mut entries = Vec::new();
+        let (mut i, mut j) = (0, 0);
+
+        while i < svc_offsets.len() && j < host_offsets.len() {
+            use std::cmp::Ordering;
+
+            match svc_offsets[i].cmp(&host_offsets[j]) {
+                Ordering::Less => i += 1,
+                Ordering::Greater => j += 1,
+                Ordering::Equal => {
+                    if let Some(entry) = self.ring_buffer.get(svc_offsets[i]) {
+                        if entry.timestamp >= t1 && entry.timestamp <= t2 {
+                            entries.push(entry.clone());
+                        }
+                    }
+                    i += 1;
+                    j += 1;
+                }
+            }
         }
+
+        QueryResult { entries }
     }
 
     /// Resolve offsets to entries, filtering by time range.
