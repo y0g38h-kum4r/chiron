@@ -24,11 +24,7 @@ pub struct PipelineConfig {
 
 impl PipelineConfig {
     /// Convenience constructor with sensible defaults for local Docker Kafka.
-    pub fn local(
-        services: Vec<String>,
-        hosts: Vec<String>,
-        logs_per_producer: u64,
-    ) -> Self {
+    pub fn local(services: Vec<String>, hosts: Vec<String>, logs_per_producer: u64) -> Self {
         Self {
             brokers: "localhost:9092".to_string(),
             topic: "chiron-logs".to_string(),
@@ -107,10 +103,7 @@ impl DummyService {
                 timestamp: start_ts + i as i64,
                 service_name: self.service_name.clone(),
                 host_id: self.host_id.clone(),
-                message: format!(
-                    "{} on {} event {}",
-                    self.service_name, self.host_id, i
-                ),
+                message: format!("{} on {} event {}", self.service_name, self.host_id, i),
                 severity: (i % 5) as u8,
             };
             self.producer.send(&entry)?;

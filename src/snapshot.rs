@@ -184,8 +184,7 @@ fn read_string(cursor: &mut &[u8]) -> io::Result<String> {
     let len = read_u32(cursor)? as usize;
     let mut bytes = vec![0u8; len];
     cursor.read_exact(&mut bytes)?;
-    String::from_utf8(bytes)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 fn read_entry(cursor: &mut &[u8]) -> io::Result<LogEntry> {

@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use chiron::chiron::ChironStore;
-use chiron::pipeline::{run_pipeline, PipelineConfig};
+use chiron::pipeline::{PipelineConfig, run_pipeline};
 
 fn main() {
     println!("=== ChironVision Log Buffer — Real Kafka Pipeline Demo ===\n");
@@ -33,7 +33,10 @@ fn main() {
     println!("  Hosts:             {:?}", config.hosts);
     println!("  Kafka partitions:  {}", config.num_partitions);
     println!("  Consumer group:    {}", config.consumer_group);
-    println!("  Producers:         {} (one per service×host)", num_producers);
+    println!(
+        "  Producers:         {} (one per service×host)",
+        num_producers
+    );
     println!("  Logs per producer: {}", logs_per_producer);
     println!("  Total expected:    {}", total_expected);
     println!();

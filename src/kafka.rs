@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use rdkafka::config::ClientConfig;
-use rdkafka::error::KafkaError;
 use rdkafka::consumer::{BaseConsumer, Consumer};
+use rdkafka::error::KafkaError;
 use rdkafka::message::{BorrowedMessage, Message};
 use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
 use rdkafka::topic_partition_list::Offset;
@@ -64,8 +64,7 @@ impl ChironProducer {
     /// Send a log entry. The host_id is used as the partition key
     /// so all logs from the same host land on the same partition (ordering guarantee).
     pub fn send(&self, entry: &LogEntry) -> Result<(), ChironKafkaError> {
-        let payload =
-            serde_json::to_string(entry).map_err(ChironKafkaError::Serialize)?;
+        let payload = serde_json::to_string(entry).map_err(ChironKafkaError::Serialize)?;
 
         self.producer
             .send(
@@ -80,7 +79,9 @@ impl ChironProducer {
 
     /// Flush all pending messages. Call after producing a batch.
     pub fn flush(&self, timeout: Duration) -> Result<(), ChironKafkaError> {
-        self.producer.flush(timeout).map_err(ChironKafkaError::Kafka)
+        self.producer
+            .flush(timeout)
+            .map_err(ChironKafkaError::Kafka)
     }
 }
 
@@ -93,11 +94,7 @@ pub struct ChironConsumer {
 impl ChironConsumer {
     /// Create a consumer subscribed to the given topic.
     /// `group_id` is the Kafka consumer group.
-    pub fn new(
-        brokers: &str,
-        topic: &str,
-        group_id: &str,
-    ) -> Result<Self, ChironKafkaError> {
+    pub fn new(brokers: &str, topic: &str, group_id: &str) -> Result<Self, ChironKafkaError> {
         let consumer: BaseConsumer = ClientConfig::new()
             .set("bootstrap.servers", brokers)
             .set("group.id", group_id)

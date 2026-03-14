@@ -313,9 +313,7 @@ impl ChironStore {
     ) -> QueryResult {
         let mut entries = Vec::new();
         for shard_idx in self.shard_positions_for_host(host) {
-            entries.extend(
-                self.shards[shard_idx].query_by_service_and_host(service, host, t1, t2),
-            );
+            entries.extend(self.shards[shard_idx].query_by_service_and_host(service, host, t1, t2));
         }
         sort_entries(&mut entries);
         QueryResult { entries }
@@ -348,11 +346,7 @@ impl ChironStore {
         self.shards.len()
     }
 
-    pub fn save_snapshot(
-        &self,
-        path: &Path,
-        kafka_offsets: &KafkaOffsets,
-    ) -> io::Result<()> {
+    pub fn save_snapshot(&self, path: &Path, kafka_offsets: &KafkaOffsets) -> io::Result<()> {
         let shards: Vec<_> = self
             .shards
             .iter()
@@ -442,7 +436,9 @@ impl ChironStore {
     }
 
     fn shard_position(&self, shard_id: u32) -> Option<usize> {
-        self.shards.iter().position(|shard| shard.shard_id == shard_id)
+        self.shards
+            .iter()
+            .position(|shard| shard.shard_id == shard_id)
     }
 
     fn ensure_shard(&mut self, shard_id: u32) -> usize {
@@ -578,7 +574,12 @@ mod tests {
 
         let host_result = store.query_by_host("h1", 0, 100);
         assert_eq!(host_result.entries.len(), 2);
-        assert!(host_result.entries.iter().all(|entry| entry.host_id == "h1"));
+        assert!(
+            host_result
+                .entries
+                .iter()
+                .all(|entry| entry.host_id == "h1")
+        );
 
         let service_result = store.query_by_service("auth", 0, 100);
         assert_eq!(service_result.entries.len(), 3);
