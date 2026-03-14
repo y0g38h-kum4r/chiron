@@ -165,6 +165,18 @@ const LOAD_NARROW_RANGE_START: i64 = 1;
 const LOAD_NARROW_RANGE_END: i64 = 3;
 const LOAD_NARROW_RANGE_COUNT: usize =
     (LOAD_NARROW_RANGE_END - LOAD_NARROW_RANGE_START + 1) as usize;
+const LOAD_ERROR_MESSAGES: [&str; 10] = [
+    "error: connection timeout",
+    "error: upstream returned 502",
+    "error: request validation failed",
+    "error: circuit breaker opened",
+    "error: kafka publish failed",
+    "error: database connection refused",
+    "error: cache miss on hot key",
+    "error: disk write latency spike",
+    "error: auth token signature invalid",
+    "error: dependency health check failed",
+];
 
 fn build_load_workload() -> (Vec<String>, Vec<String>, Vec<LogEntry>) {
     let services: Vec<String> = (0..LOAD_SERVICE_COUNT)
@@ -175,14 +187,18 @@ fn build_load_workload() -> (Vec<String>, Vec<String>, Vec<LogEntry>) {
         .collect();
 
     let mut entries = Vec::with_capacity(LOAD_TOTAL_ROWS);
-    for service in &services {
-        for host in &hosts {
+    for (service_idx, service) in services.iter().enumerate() {
+        for (host_idx, host) in hosts.iter().enumerate() {
             for ts in 0..LOAD_ROWS_PER_PAIR {
+                let msg_idx = (service_idx * 31 + host_idx * 17 + ts) % LOAD_ERROR_MESSAGES.len();
                 entries.push(LogEntry {
                     timestamp: ts as i64,
                     service_name: service.clone(),
                     host_id: host.clone(),
-                    message: "m".to_string(),
+                    message: format!(
+                        "{} on svc {} host {} at ts {} with trace id abc-def-ghi-jkl-mno-pqr-stu",
+                        LOAD_ERROR_MESSAGES[msg_idx], service, host, ts
+                    ),
                     severity: (ts % 8) as u8,
                 });
             }
