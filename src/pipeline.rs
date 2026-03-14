@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use std::{env, fmt::Display};
 
 use crate::chiron::ChironStore;
 use crate::kafka::{ChironConsumer, ChironProducer};
@@ -29,13 +30,41 @@ impl PipelineConfig {
         Self {
             brokers: "localhost:9092".to_string(),
             topic: "chiron-logs".to_string(),
-            num_partitions: 4,
-            ring_buffer_capacity: 100_000,
+            num_partitions: env_u32("CHIRON_NUM_PARTITIONS", 4),
+            ring_buffer_capacity: env_usize("CHIRON_RING_BUFFER_CAPACITY", 100_000),
             services,
             hosts,
             logs_per_producer,
             consumer_group: "chiron-pipeline".to_string(),
         }
+    }
+}
+
+fn env_u32(name: &str, default: u32) -> u32 {
+    env_parsed(name).unwrap_or(default)
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    env_parsed(name).unwrap_or(default)
+}
+
+fn env_parsed<T>(name: &str) -> Option<T>
+where
+    T: std::str::FromStr,
+    T::Err: Display,
+{
+    match env::var(name) {
+        Ok(raw) => match raw.parse::<T>() {
+            Ok(value) => Some(value),
+            Err(err) => {
+                eprintln!(
+                    "invalid value for {}: {:?} ({}) - falling back to default",
+                    name, raw, err
+                );
+                None
+            }
+        },
+        Err(_) => None,
     }
 }
 

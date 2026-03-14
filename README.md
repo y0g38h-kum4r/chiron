@@ -143,3 +143,21 @@ src/
 cargo run     # Run demo
 cargo test    # Run all tests
 ```
+
+### Configuration
+
+The local demo reads these environment variables so you do not have to hardcode sizing in Rust:
+
+- `CHIRON_NUM_PARTITIONS`: Kafka topic partition count and the number of consumer threads to spawn. Default: `4`
+- `CHIRON_RING_BUFFER_CAPACITY`: in-memory ring buffer capacity. Default: `100000`
+
+Example:
+
+```bash
+export CHIRON_NUM_PARTITIONS=8
+export CHIRON_RING_BUFFER_CAPACITY=250000
+docker compose up -d
+cargo run
+```
+
+`docker-compose.yml` also uses `CHIRON_NUM_PARTITIONS` for Kafka's `KAFKA_NUM_PARTITIONS`, so setting the env var keeps the broker default and the app config aligned.

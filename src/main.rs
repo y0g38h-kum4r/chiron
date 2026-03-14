@@ -24,6 +24,7 @@ fn main() {
     let total_expected = num_producers as u64 * logs_per_producer;
 
     let config = PipelineConfig::local(services.clone(), hosts.clone(), logs_per_producer);
+    let num_partitions = config.num_partitions;
 
     println!("Configuration:");
     println!("  Brokers:           {}", config.brokers);
@@ -54,7 +55,7 @@ fn main() {
 
     // --- Show Kafka consumer offsets ---
     println!("Kafka consumer offsets:");
-    for p in 0..4 {
+    for p in 0..num_partitions {
         let off = stats.kafka_offsets.get("chiron-logs", p).unwrap_or(0);
         println!("  chiron-logs/partition-{}: offset {}", p, off);
     }
