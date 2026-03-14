@@ -7,6 +7,8 @@
 //! Run with:  cargo test --test e2e -- --ignored
 
 use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -155,6 +157,8 @@ const LOAD_TOTAL_ROWS: usize = LOAD_SERVICE_COUNT * LOAD_HOST_COUNT * LOAD_ROWS_
 const LOAD_QUERY_COUNT: usize = 10_000;
 const LOAD_INITIAL_SHARDS: usize = 8;
 const LOAD_PRODUCER_FLUSH_EVERY: usize = 25_000;
+const LOAD_QUERY_START_AFTER_ROWS: u64 = 50_000;
+const LOAD_INDEX_FLUSH_INTERVAL_MS: u64 = 10;
 
 const LOAD_FULL_RANGE_START: i64 = 0;
 const LOAD_FULL_RANGE_END: i64 = LOAD_ROWS_PER_PAIR as i64 - 1;
@@ -178,7 +182,7 @@ const LOAD_ERROR_MESSAGES: [&str; 10] = [
     "error: dependency health check failed",
 ];
 
-fn build_load_workload() -> (Vec<String>, Vec<String>, Vec<LogEntry>) {
+fn build_load_dimensions() -> (Vec<String>, Vec<String>) {
     let services: Vec<String> = (0..LOAD_SERVICE_COUNT)
         .map(|idx| format!("svc-{idx:03}"))
         .collect();
@@ -186,26 +190,184 @@ fn build_load_workload() -> (Vec<String>, Vec<String>, Vec<LogEntry>) {
         .map(|idx| format!("host-{idx:03}"))
         .collect();
 
-    let mut entries = Vec::with_capacity(LOAD_TOTAL_ROWS);
-    for (service_idx, service) in services.iter().enumerate() {
-        for (host_idx, host) in hosts.iter().enumerate() {
-            for ts in 0..LOAD_ROWS_PER_PAIR {
-                let msg_idx = (service_idx * 31 + host_idx * 17 + ts) % LOAD_ERROR_MESSAGES.len();
-                entries.push(LogEntry {
-                    timestamp: ts as i64,
-                    service_name: service.clone(),
-                    host_id: host.clone(),
-                    message: format!(
-                        "{} on svc {} host {} at ts {} with trace id abc-def-ghi-jkl-mno-pqr-stu",
-                        LOAD_ERROR_MESSAGES[msg_idx], service, host, ts
-                    ),
-                    severity: (ts % 8) as u8,
-                });
-            }
-        }
+    (services, hosts)
+}
+
+fn make_load_entry(
+    service_idx: usize,
+    service: &str,
+    host_idx: usize,
+    host: &str,
+    ts: usize,
+) -> LogEntry {
+    let msg_idx = (service_idx * 31 + host_idx * 17 + ts) % LOAD_ERROR_MESSAGES.len();
+
+    LogEntry {
+        timestamp: ts as i64,
+        service_name: service.to_string(),
+        host_id: host.to_string(),
+        message: format!(
+            "{} on svc {} host {} at ts {} with trace id abc-def-ghi-jkl-mno-pqr-stu",
+            LOAD_ERROR_MESSAGES[msg_idx], service, host, ts
+        ),
+        severity: (ts % 8) as u8,
+    }
+}
+
+fn assert_live_query_result(
+    entries: &[LogEntry],
+    service: Option<&str>,
+    host: Option<&str>,
+    t1: i64,
+    t2: i64,
+    max_expected: usize,
+) -> usize {
+    assert!(
+        entries.len() <= max_expected,
+        "live query returned more rows than the fully built dataset allows"
+    );
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.timestamp >= t1 && entry.timestamp <= t2),
+        "live query returned an entry outside the requested time range"
+    );
+
+    if let Some(service_name) = service {
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.service_name == service_name),
+            "live service query returned an entry for the wrong service"
+        );
     }
 
-    (services, hosts, entries)
+    if let Some(host_id) = host {
+        assert!(
+            entries.iter().all(|entry| entry.host_id == host_id),
+            "live host query returned an entry for the wrong host"
+        );
+    }
+
+    entries.len()
+}
+
+fn run_live_load_queries(
+    store: Arc<Mutex<ChironStore>>,
+    services: Vec<String>,
+    hosts: Vec<String>,
+    consumed_rows: Arc<AtomicU64>,
+    consumer_done: Arc<AtomicBool>,
+) -> usize {
+    while consumed_rows.load(Ordering::SeqCst) < LOAD_QUERY_START_AFTER_ROWS
+        && !consumer_done.load(Ordering::SeqCst)
+    {
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    let service_full_hits = LOAD_HOST_COUNT * LOAD_ROWS_PER_PAIR;
+    let service_mid_hits = LOAD_HOST_COUNT * LOAD_MID_RANGE_COUNT;
+    let host_full_hits = LOAD_SERVICE_COUNT * LOAD_ROWS_PER_PAIR;
+    let host_mid_hits = LOAD_SERVICE_COUNT * LOAD_MID_RANGE_COUNT;
+    let pair_full_hits = LOAD_ROWS_PER_PAIR;
+    let pair_narrow_hits = LOAD_NARROW_RANGE_COUNT;
+
+    let mut total_hits = 0usize;
+
+    for query_idx in 0..LOAD_QUERY_COUNT {
+        let store = store.lock().unwrap();
+
+        total_hits += match query_idx % 6 {
+            0 => {
+                let service = &services[query_idx % LOAD_SERVICE_COUNT];
+                let result =
+                    store.query_by_service(service, LOAD_FULL_RANGE_START, LOAD_FULL_RANGE_END);
+                assert_live_query_result(
+                    &result.entries,
+                    Some(service),
+                    None,
+                    LOAD_FULL_RANGE_START,
+                    LOAD_FULL_RANGE_END,
+                    service_full_hits,
+                )
+            }
+            1 => {
+                let service = &services[query_idx % LOAD_SERVICE_COUNT];
+                let result =
+                    store.query_by_service(service, LOAD_MID_RANGE_START, LOAD_MID_RANGE_END);
+                assert_live_query_result(
+                    &result.entries,
+                    Some(service),
+                    None,
+                    LOAD_MID_RANGE_START,
+                    LOAD_MID_RANGE_END,
+                    service_mid_hits,
+                )
+            }
+            2 => {
+                let host = &hosts[query_idx % LOAD_HOST_COUNT];
+                let result = store.query_by_host(host, LOAD_FULL_RANGE_START, LOAD_FULL_RANGE_END);
+                assert_live_query_result(
+                    &result.entries,
+                    None,
+                    Some(host),
+                    LOAD_FULL_RANGE_START,
+                    LOAD_FULL_RANGE_END,
+                    host_full_hits,
+                )
+            }
+            3 => {
+                let host = &hosts[query_idx % LOAD_HOST_COUNT];
+                let result = store.query_by_host(host, LOAD_MID_RANGE_START, LOAD_MID_RANGE_END);
+                assert_live_query_result(
+                    &result.entries,
+                    None,
+                    Some(host),
+                    LOAD_MID_RANGE_START,
+                    LOAD_MID_RANGE_END,
+                    host_mid_hits,
+                )
+            }
+            4 => {
+                let service = &services[query_idx % LOAD_SERVICE_COUNT];
+                let host = &hosts[(query_idx * 7) % LOAD_HOST_COUNT];
+                let result = store.query_by_service_and_host(
+                    service,
+                    host,
+                    LOAD_FULL_RANGE_START,
+                    LOAD_FULL_RANGE_END,
+                );
+                assert_live_query_result(
+                    &result.entries,
+                    Some(service),
+                    Some(host),
+                    LOAD_FULL_RANGE_START,
+                    LOAD_FULL_RANGE_END,
+                    pair_full_hits,
+                )
+            }
+            _ => {
+                let service = &services[query_idx % LOAD_SERVICE_COUNT];
+                let host = &hosts[(query_idx * 7) % LOAD_HOST_COUNT];
+                let result = store.query_by_service_and_host(
+                    service,
+                    host,
+                    LOAD_NARROW_RANGE_START,
+                    LOAD_NARROW_RANGE_END,
+                );
+                assert_live_query_result(
+                    &result.entries,
+                    Some(service),
+                    Some(host),
+                    LOAD_NARROW_RANGE_START,
+                    LOAD_NARROW_RANGE_END,
+                    pair_narrow_hits,
+                )
+            }
+        };
+    }
+
+    total_hits
 }
 
 fn run_load_queries(store: &ChironStore, services: &[String], hosts: &[String]) -> usize {
@@ -954,7 +1116,8 @@ fn kafka_sharded_eviction_keeps_newest_global_entries() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 11: Kafka-backed load test with 1M ingests and 10k queries
+// Test 11: Kafka-backed streaming load test with concurrent ingest, indexing,
+// and queries against the live store.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -966,76 +1129,168 @@ fn kafka_1m_ingest_and_10k_queries() {
 
     let topic = unique_topic("e2e-kafka-load");
     let group = format!("{}-group", topic);
-    let (services, hosts, entries) = build_load_workload();
+    let (services, hosts) = build_load_dimensions();
 
-    let mut store = ChironStore::with_shards(LOAD_TOTAL_ROWS, LOAD_INITIAL_SHARDS);
+    let store = Arc::new(Mutex::new(ChironStore::with_shards(
+        LOAD_TOTAL_ROWS,
+        LOAD_INITIAL_SHARDS,
+    )));
+    let consumed_rows = Arc::new(AtomicU64::new(0));
+    let consumer_done = Arc::new(AtomicBool::new(false));
+
     let total_start = Instant::now();
 
-    let producer = ChironProducer::new(BROKERS, &topic).unwrap();
-    let produce_start = Instant::now();
-    for (idx, entry) in entries.iter().enumerate() {
-        producer.send(entry).unwrap();
-        if (idx + 1) % LOAD_PRODUCER_FLUSH_EVERY == 0 {
-            producer.flush(Duration::from_secs(30)).unwrap();
-        }
-    }
-    producer.flush(Duration::from_secs(30)).unwrap();
-    let produce_elapsed = produce_start.elapsed();
-    drop(producer);
+    let producer_topic = topic.clone();
+    let producer_services = services.clone();
+    let producer_hosts = hosts.clone();
+    let producer_thread = thread::spawn(move || {
+        let producer = ChironProducer::new(BROKERS, &producer_topic).unwrap();
+        let produce_start = Instant::now();
+        let mut sent = 0usize;
 
-    let consumer = ChironConsumer::new(BROKERS, &topic, &group).unwrap();
-    let consume_start = Instant::now();
-    let mut consumed = 0u64;
-    let poll_timeout = Duration::from_millis(500);
-    let idle_deadline = Duration::from_secs(30);
-    let mut last_msg = Instant::now();
+        // Interleave timestamps across all service/host pairs so live queries
+        // observe broad partial coverage while the stream is still building.
+        for ts in 0..LOAD_ROWS_PER_PAIR {
+            for (service_idx, service) in producer_services.iter().enumerate() {
+                for (host_idx, host) in producer_hosts.iter().enumerate() {
+                    let entry = make_load_entry(service_idx, service, host_idx, host, ts);
+                    producer.send(&entry).unwrap();
+                    sent += 1;
 
-    loop {
-        match consumer.poll(poll_timeout) {
-            Ok(Some((entry, partition, _offset))) => {
-                store.ingest_partition(partition as u32, entry);
-                consumed += 1;
-                last_msg = Instant::now();
-                if consumed == LOAD_TOTAL_ROWS as u64 {
-                    break;
+                    if sent % LOAD_PRODUCER_FLUSH_EVERY == 0 {
+                        producer.flush(Duration::from_secs(30)).unwrap();
+                    }
                 }
             }
-            Ok(None) => {
-                if consumed >= LOAD_TOTAL_ROWS as u64 || last_msg.elapsed() >= idle_deadline {
-                    break;
-                }
-            }
-            Err(err) => panic!("consumer poll failed: {err}"),
         }
-    }
-    consumer.commit().unwrap();
-    let consume_elapsed = consume_start.elapsed();
 
-    assert_eq!(consumed, LOAD_TOTAL_ROWS as u64);
-    assert_eq!(store.len(), LOAD_TOTAL_ROWS);
+        producer.flush(Duration::from_secs(30)).unwrap();
+        produce_start.elapsed()
+    });
 
-    let flush_start = Instant::now();
-    store.flush_indexer();
-    let flush_elapsed = flush_start.elapsed();
+    let consumer_topic = topic.clone();
+    let consumer_group = group.clone();
+    let consumer_store = Arc::clone(&store);
+    let consumer_count = Arc::clone(&consumed_rows);
+    let consumer_done_flag = Arc::clone(&consumer_done);
+    let consumer_thread = thread::spawn(move || {
+        let consumer = ChironConsumer::new(BROKERS, &consumer_topic, &consumer_group).unwrap();
+        let consume_start = Instant::now();
+        let poll_timeout = Duration::from_millis(500);
+        let idle_deadline = Duration::from_secs(30);
+        let mut last_msg = Instant::now();
 
-    assert_eq!(store.indexer_lag(), 0);
+        loop {
+            match consumer.poll(poll_timeout) {
+                Ok(Some((entry, partition, _offset))) => {
+                    {
+                        let mut store = consumer_store.lock().unwrap();
+                        store.ingest_partition(partition as u32, entry);
+                    }
 
-    let query_start = Instant::now();
-    let total_hits = run_load_queries(&store, &services, &hosts);
-    let query_elapsed = query_start.elapsed();
+                    let consumed = consumer_count.fetch_add(1, Ordering::SeqCst) + 1;
+                    last_msg = Instant::now();
+
+                    if consumed == LOAD_TOTAL_ROWS as u64 {
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    if consumer_count.load(Ordering::SeqCst) >= LOAD_TOTAL_ROWS as u64
+                        || last_msg.elapsed() >= idle_deadline
+                    {
+                        break;
+                    }
+                }
+                Err(err) => panic!("consumer poll failed: {err}"),
+            }
+        }
+
+        consumer.commit().unwrap();
+        consumer_done_flag.store(true, Ordering::SeqCst);
+        consume_start.elapsed()
+    });
+
+    let index_store = Arc::clone(&store);
+    let index_done = Arc::clone(&consumer_done);
+    let indexer_thread = thread::spawn(move || {
+        let mut flushes = 0u64;
+
+        loop {
+            let should_stop = {
+                let mut store = index_store.lock().unwrap();
+                store.flush_indexer();
+                flushes += 1;
+                index_done.load(Ordering::SeqCst) && store.indexer_lag() == 0
+            };
+
+            if should_stop {
+                break;
+            }
+
+            thread::sleep(Duration::from_millis(LOAD_INDEX_FLUSH_INTERVAL_MS));
+        }
+
+        flushes
+    });
+
+    let query_store = Arc::clone(&store);
+    let query_count = Arc::clone(&consumed_rows);
+    let query_done = Arc::clone(&consumer_done);
+    let query_services = services.clone();
+    let query_hosts = hosts.clone();
+    let query_thread = thread::spawn(move || {
+        let query_start = Instant::now();
+        let live_hits = run_live_load_queries(
+            query_store,
+            query_services,
+            query_hosts,
+            query_count,
+            query_done,
+        );
+
+        (query_start.elapsed(), live_hits)
+    });
+
+    let produce_elapsed = producer_thread.join().unwrap();
+    let consume_elapsed = consumer_thread.join().unwrap();
+    let index_flushes = indexer_thread.join().unwrap();
+    let (live_query_elapsed, live_hits) = query_thread.join().unwrap();
     let total_elapsed = total_start.elapsed();
 
+    assert_eq!(consumed_rows.load(Ordering::SeqCst), LOAD_TOTAL_ROWS as u64);
+
+    let (store_len, store_shards, indexer_lag) = {
+        let store = store.lock().unwrap();
+        (store.len(), store.shard_count(), store.indexer_lag())
+    };
+
+    assert_eq!(store_len, LOAD_TOTAL_ROWS);
+    assert_eq!(indexer_lag, 0);
+
+    let verify_start = Instant::now();
+    let total_hits = {
+        let store = store.lock().unwrap();
+        run_load_queries(&store, &services, &hosts)
+    };
+    let verify_elapsed = verify_start.elapsed();
+
+    assert!(
+        live_hits > 0,
+        "live query thread should observe at least some indexed rows"
+    );
+
     eprintln!(
-        "kafka_load_e2e: rows={LOAD_TOTAL_ROWS}, queries={LOAD_QUERY_COUNT}, store_shards={}, \
-produce={:.3}s ({:.0} rows/s), consume_ingest={:.3}s ({:.0} rows/s), flush={:.3}s, queries={:.3}s ({:.0} q/s), total={:.3}s, total_hits={total_hits}",
-        store.shard_count(),
+        "kafka_load_e2e: rows={LOAD_TOTAL_ROWS}, live_queries={LOAD_QUERY_COUNT}, store_shards={store_shards}, \
+produce={:.3}s ({:.0} rows/s), consume_ingest={:.3}s ({:.0} rows/s), live_query={:.3}s ({:.0} q/s), \
+index_flushes={index_flushes}, total_streaming={:.3}s, final_verify={:.3}s, live_hits={live_hits}, total_hits={total_hits}",
         produce_elapsed.as_secs_f64(),
         LOAD_TOTAL_ROWS as f64 / produce_elapsed.as_secs_f64(),
         consume_elapsed.as_secs_f64(),
         LOAD_TOTAL_ROWS as f64 / consume_elapsed.as_secs_f64(),
-        flush_elapsed.as_secs_f64(),
-        query_elapsed.as_secs_f64(),
-        LOAD_QUERY_COUNT as f64 / query_elapsed.as_secs_f64(),
+        live_query_elapsed.as_secs_f64(),
+        LOAD_QUERY_COUNT as f64 / live_query_elapsed.as_secs_f64(),
         total_elapsed.as_secs_f64(),
+        verify_elapsed.as_secs_f64(),
     );
 }

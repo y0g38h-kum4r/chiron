@@ -188,12 +188,6 @@ Kafka integration tests are ignored by default:
 cargo test --test e2e -- --ignored --nocapture
 ```
 
-Release-mode load-style benchmarks:
-
-```bash
-cargo test --release --test load_e2e store_1m_ingest_and_10k_queries -- --ignored --nocapture
-```
-
 ```bash
 cargo test --release --test e2e kafka_1m_ingest_and_10k_queries -- --ignored --nocapture
 ```
@@ -204,6 +198,10 @@ Go benchmark:
 cd go_three_maps
 go run .
 ```
+
+The Go benchmark now mirrors the streaming-style Rust load test: it builds rows on
+the fly, ingests into a live store, issues concurrent queries during ingestion,
+then runs one final exact verification pass after the stream completes.
 
 If no broker is reachable at `localhost:9092`, the E2E tests skip with a message instead of failing noisily.
 
