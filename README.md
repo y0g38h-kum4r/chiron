@@ -1,163 +1,196 @@
 # ChironVision Log Buffer
 
-An in-memory log storage system for incident detection in streaming observability systems.
+An in-memory, Kafka-backed log store for incident-style queries over recent observability data.
 
 ## Assumptions
 
-1. **Timestamps are monotonically non-decreasing.** Logs arrive roughly in order (small jitter acceptable). This is standard for streaming observability pipelines — you won't see a log from `t=500` arrive after hours of ingesting at `t=10000`.
+1. **Timestamps are roughly monotonic.** Logs arrive mostly in order, with only small jitter.
+2. **`ByService` and `ByHost` are both primary query paths.** `ByServiceAndHost` is a narrower confirmation query built on top of them.
+3. **Oldest data is least relevant.** Eviction should prefer the oldest entries first.
+4. **Small indexing lag is acceptable.** Newly ingested records may become queryable a short time after they are accepted.
 
-2. **ByService and ByHost queries have equal importance.** During incident investigation, engineers use both interchangeably as primary lenses. ByServiceAndHost is a lower-frequency confirmation query.
+## Architecture: Partition-Local Shards
 
-3. **Oldest data is least relevant.** With monotonically increasing timestamps, the oldest entries in the buffer are always the eviction candidates. No per-window scoring needed — head eviction is the correct policy.
+The store is organized as **partition-local shards**. Each shard owns:
 
-4. **Indexing lag (microseconds to low milliseconds) is acceptable.** For an observability system querying minute-level windows, the delay between write and queryability is invisible.
+- its own append buffer
+- its own service index
+- its own host index
+- its own indexer position
 
-## Architecture: Shared Log + Async Indexing
+In the Kafka pipeline, the store is created with one shard per Kafka partition. Consumed records are routed into the shard for the **actual Kafka partition returned by the broker**.
 
-The key insight: **separate the write path from the read path.** Instead of sharding (which forces a tradeoff where one query type always requires fan-out), use a single shared append-only log with independently built indexes.
+This keeps the storage model aligned with Kafka's partitioning and makes host-routed queries cheap when `host_id` is the partitioning key.
 
-### Why not shard?
+### Current Implementation Caveat
 
-| Shard by | Write throughput | ByService | ByHost | ByServiceAndHost |
-|----------|-----------------|-----------|--------|------------------|
-| time-range | 1 core (all writes hit "now") | 1 shard | 1 shard | 1 shard |
-| hash(service) | N cores | 1 shard | N shards (fan-out) | 1 shard |
-| hash(host) | N cores | N shards (fan-out) | 1 shard | 1 shard |
-| hash(svc\|host) | N cores | N shards (fan-out) | N shards (fan-out) | 1 shard |
+The store is shard-aware internally, but the current pipeline still wraps the top-level `ChironStore` in one `Mutex`. So:
 
-Every sharding strategy makes at least one of the two primary query types expensive. The shared log approach avoids this tradeoff entirely.
+- records are routed to partition-local shards
+- indexes are partition-local
+- queries can avoid unnecessary fanout
 
-### Write Path
+but ingestion is still coordinated through one top-level lock in the current prototype.
 
-```
-Writer 0 ──┐
-Writer 1 ──┼──► Shared Ring Buffer (atomic fetch_add on write_pos)
-Writer 2 ──┤    [log0][log1][log2][log3][log4][log5]...
-Writer 3 ──┘
-            Zero contention between writers.
-            Write throughput = N cores × memory bandwidth.
-```
+## Write Path
 
-Writers only touch the ring buffer — no index updates, no routing decisions. In production, `write_pos` is an `AtomicU64` and each writer reserves a unique slot via `fetch_add`.
-
-### Index Path (Async)
-
-```
-Ring Buffer: [log0][log1][log2][log3][log4][log5][log6]...
-                                              ▲         ▲
-                                        indexer_pos   write_pos
-
-Indexer thread reads from indexer_pos → write_pos:
-  → Inserts into service_index (service_name → [offsets])
-  → Inserts into host_index    (host_id → [offsets])
+```text
+Producer threads
+  -> Kafka topic (key = host_id)
+  -> consumer threads in one group
+  -> batch records
+  -> route each record by Kafka partition
+  -> append into that shard's local buffer
+  -> commit Kafka offsets after local ingest succeeds
 ```
 
-The gap between `indexer_pos` and `write_pos` is the indexing lag. Entries in this gap are written but not yet queryable.
+Two write APIs exist in the store:
 
-### Read Path
+- `ingest(entry)`: local host-hash routing, useful for tests and in-memory use
+- `ingest_partition(partition_id, entry)`: explicit shard routing, used by the Kafka pipeline
 
-All three query types are single-index lookups — no fan-out:
+## Index Path
 
-```
-ByService("auth", t1, t2)          → service_index["auth"]     → offsets → filter by time
-ByHost("h1", t1, t2)               → host_index["h1"]          → offsets → filter by time
-ByServiceAndHost("auth","h1",t1,t2) → intersect(service, host) → offsets → filter by time
-```
+Each shard maintains local inverted indexes:
 
-### Eviction
+- `service_name -> [local shard offsets]`
+- `host_id -> [local shard offsets]`
 
-With monotonically increasing timestamps, eviction is simply **head eviction** — drop the oldest entries first. No scoring, no decay functions, no ordering structures needed. The ring buffer naturally overwrites from the head when full.
+The store also maintains a `host_routes` map while indexing so host-aware queries can usually go straight to the shard or shards that actually contain that host.
 
-## Durability: Hourly Snapshots + Kafka Replay
+The current pipeline runs a background indexer thread that periodically calls `flush_indexer()` across all shards. Query freshness therefore depends on indexer lag.
 
-The in-memory ring buffer is volatile. Durability is achieved via periodic checkpointing combined with Kafka replay:
+## Read Path
 
-```
-Normal operation:
+### `ByService(service, t1, t2)`
 
-  Kafka ──► Consumer threads ──► RingBuffer ──► Indexer ──► Indexes
-                 │
-                 tracks consumer offsets per topic/partition
+- fan out across shards
+- query each shard's local service index
+- merge and sort matching entries by timestamp
 
-Every hour:
+### `ByHost(host, t1, t2)`
 
-  1. Pause consumers
-  2. Snapshot = ring buffer entries + Kafka consumer offsets
-  3. Write to disk (atomic: write to .tmp, then rename)
-  4. Resume consumers
-```
+- use `host_routes` when available to query only known shard(s) for that host
+- fall back to fanout if the host has not been indexed yet
 
-### Recovery after crash
+### `ByServiceAndHost(service, host, t1, t2)`
 
-```
-1. Load latest snapshot from disk
-   → ring buffer restored to hour-ago state
-   → Kafka consumer offsets restored
+- use `host_routes` to narrow to the relevant shard(s)
+- intersect the local service and host posting lists inside each shard
+- merge the results
 
-2. Resume Kafka consumers from recorded offsets
-   → replays the last ≤1 hour of logs
-   → ring buffer catches up to present
+This means the current architecture accepts bounded fanout for `ByService`, while keeping `ByHost` and `ByServiceAndHost` narrow when routing information is available.
 
-3. Indexes are rebuilt from the ring buffer automatically
-   → flush_indexer() over the full buffer
-   → queries work immediately
-```
+## Why Dynamic Buffers Per Shard?
 
-### Key invariants
+Sharding and local buffers solve different problems:
 
-- **Zero data loss**: Kafka retains the full stream. The snapshot saves replay time, not data.
-- **Atomic writes**: snapshot is written to a `.tmp` file first, then atomically renamed. A crash mid-write leaves the previous good snapshot intact.
-- **Indexes are not snapshotted**: they are rebuilt from the ring buffer on restore. Re-indexing 1M entries takes milliseconds.
-- **Kafka retention must exceed snapshot interval**: if you snapshot every hour, Kafka must retain at least 2 hours (safety margin).
+- **Sharding** gives partition-local ownership and bounded fanout.
+- **Dynamic shard-local buffers** keep append order and local offsets while letting hot shards borrow more of the global live-entry budget.
 
-### Snapshot format
+The current store does **not** slice capacity evenly across shards anymore. Instead:
 
-```
-┌─────────────────────────────────┐
-│ magic "CHIRON01"        8 bytes │
-│ ring buffer capacity    8 bytes │
-│ global_offset           8 bytes │
-│ entry count             8 bytes │
-│ entries[]           variable    │
-│ kafka topic count       4 bytes │
-│ kafka offsets[]     variable    │
-└─────────────────────────────────┘
-```
+- the store has one global live-entry budget
+- hot shards can temporarily hold more entries than cold shards
+- eviction still happens globally by oldest timestamp
+- partition-local indexes stay intact
+
+## Eviction
+
+Eviction remains **oldest-first**, but it is now computed across shards.
+
+The store compares the oldest live timestamp in each shard and repeatedly evicts from the globally oldest shard until the target capacity is reached. This preserves the "oldest data is least relevant" policy even though data is spread across multiple shard-local buffers.
+
+## Durability: Kafka Replay + Sharded Snapshots
+
+Kafka remains the durable source of truth. The in-memory store is a fast query cache for recent data.
+
+### Snapshot Contents
+
+`ChironStore::save_snapshot` writes a single **sharded snapshot file** containing:
+
+- snapshot magic `CHIRON02`
+- shard count
+- for each shard:
+  - shard id
+  - next local offset
+  - live entries in oldest-to-newest order
+- Kafka offsets supplied by the caller
+
+The snapshot write path is durable:
+
+- write temp file
+- `fsync` temp file
+- rename into place
+- `fsync` the parent directory
+
+### Recovery
+
+Recovery does the following:
+
+1. Load every shard from the snapshot file.
+2. Rebuild shard-local indexes by calling `flush_indexer()`.
+3. Restore Kafka offsets from the snapshot.
+4. Resume consumers from those offsets and replay forward.
+
+### Important Snapshot Limitation
+
+The current code does **not** coordinate a live snapshot barrier with the consumers. `save_snapshot` serializes the current in-memory shard state together with the Kafka offsets provided by the caller, but it does not pause ingestion or atomically capture "buffer state + offsets" from one globally synchronized instant.
+
+That means:
+
+- snapshots are fully durable on disk once written
+- restore works correctly for the serialized state
+- but a live snapshot is only as consistent as the caller's offset capture strategy
+
+For offline snapshots taken after ingestion stops, this is fine. For live streaming snapshots, this is still an area for future improvement.
 
 ## File Structure
 
-```
+```text
 src/
 ├── lib.rs               # Module declarations
-├── main.rs              # Demo (ingest, query, snapshot/restore)
+├── main.rs              # Demo entrypoint
 ├── log_entry.rs         # LogEntry struct
-├── ring_buffer.rs       # Shared append-only circular buffer
-├── inverted_index.rs    # Per-dimension offset indexes (service, host)
-├── snapshot.rs          # Binary snapshot serialization + KafkaOffsets
-└── chiron.rs            # ChironStore: shared log + indexer + eviction + snapshots
+├── ring_buffer.rs       # Fixed-capacity buffer used by low-level helpers/tests
+├── inverted_index.rs    # Local service/host posting lists
+├── kafka.rs             # Kafka producer/consumer wrappers
+├── pipeline.rs          # Kafka pipeline and background indexer
+├── snapshot.rs          # Snapshot encoding/decoding
+└── chiron.rs            # Shard-aware ChironStore
 ```
 
 ## Usage
 
 ```bash
-cargo run     # Run demo
-cargo test    # Run all tests
+cargo run
+cargo test
 ```
 
-### Configuration
+Kafka integration tests are ignored by default:
 
-The local demo reads these environment variables so you do not have to hardcode sizing in Rust:
+```bash
+cargo test --test e2e -- --ignored --nocapture
+```
 
-- `CHIRON_NUM_PARTITIONS`: Kafka topic partition count and the number of consumer threads to spawn. Default: `4`
-- `CHIRON_RING_BUFFER_CAPACITY`: in-memory ring buffer capacity. Default: `100000`
+If no broker is reachable at `localhost:9092`, the E2E tests skip with a message instead of failing noisily.
+
+## Configuration
+
+The local demo reads these environment variables:
+
+- `CHIRON_NUM_PARTITIONS`: Kafka topic partition count and shard count used by the pipeline. Default: `4`
+- `CHIRON_RING_BUFFER_CAPACITY`: total in-memory capacity distributed across shards. Default: `100000`
+- `CHIRON_INDEX_FLUSH_INTERVAL_MS`: background indexer flush interval in milliseconds. Default: `50`
 
 Example:
 
 ```bash
 export CHIRON_NUM_PARTITIONS=8
 export CHIRON_RING_BUFFER_CAPACITY=250000
+export CHIRON_INDEX_FLUSH_INTERVAL_MS=25
 docker compose up -d
 cargo run
 ```
 
-`docker-compose.yml` also uses `CHIRON_NUM_PARTITIONS` for Kafka's `KAFKA_NUM_PARTITIONS`, so setting the env var keeps the broker default and the app config aligned.
+`docker-compose.yml` also uses `CHIRON_NUM_PARTITIONS` for Kafka's `KAFKA_NUM_PARTITIONS`, so keeping that env var aligned makes the demo behavior more predictable.

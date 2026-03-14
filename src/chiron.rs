@@ -1,113 +1,191 @@
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::Path;
 
 use crate::inverted_index::InvertedIndex;
 use crate::log_entry::LogEntry;
-use crate::ring_buffer::RingBuffer;
-use crate::snapshot::{KafkaOffsets, Snapshot};
+use crate::snapshot::{KafkaOffsets, RestoredShard, Snapshot, SnapshotShard};
 
-/// Unified ChironStore: shared append-only log with async indexing.
+/// Partition-local Chiron store.
 ///
-/// Write path:  append to ring buffer (lock-free in production via atomic fetch_add).
-/// Index path:  indexer trails behind write head, building service + host indexes.
-/// Read path:   index lookup → offsets → ring buffer reads. No fan-out for any query type.
-/// Eviction:    head-only (oldest first) — with monotonic timestamps, oldest = least relevant.
+/// Each shard owns its own append buffer and indexes so Kafka partition traffic
+/// can be routed into independent hot paths. The total number of live entries
+/// is governed by a single global budget on the store, so hot partitions can
+/// consume more of the available space without being capped by a fixed local
+/// slice of the capacity.
 pub struct ChironStore {
-    /// Single shared ring buffer holding all log data.
-    ring_buffer: RingBuffer,
+    shards: Vec<PartitionShard>,
+    host_routes: HashMap<String, BTreeSet<u32>>,
+    total_capacity: usize,
+}
 
-    // --- Indexer state ---
-    /// How far the indexer has processed (trails behind ring_buffer.next_offset()).
+struct PartitionShard {
+    shard_id: u32,
+    buffer: PartitionBuffer,
     indexer_pos: u64,
-    /// Inverted index: service_name → [offsets].
     service_index: InvertedIndex,
-    /// Inverted index: host_id → [offsets].
     host_index: InvertedIndex,
+}
+
+struct PartitionBuffer {
+    entries: VecDeque<LogEntry>,
+    oldest_offset: u64,
+    next_offset: u64,
 }
 
 pub struct QueryResult {
     pub entries: Vec<LogEntry>,
 }
 
-impl ChironStore {
-    pub fn new(capacity: usize) -> Self {
+impl PartitionBuffer {
+    fn new() -> Self {
         Self {
-            ring_buffer: RingBuffer::new(capacity),
+            entries: VecDeque::new(),
+            oldest_offset: 0,
+            next_offset: 0,
+        }
+    }
+
+    fn from_snapshot(next_offset: u64, entries: Vec<LogEntry>) -> io::Result<Self> {
+        if next_offset < entries.len() as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "next offset must be >= live entry count",
+            ));
+        }
+
+        Ok(Self {
+            oldest_offset: next_offset - entries.len() as u64,
+            next_offset,
+            entries: entries.into(),
+        })
+    }
+
+    fn push(&mut self, entry: LogEntry) -> u64 {
+        let offset = self.next_offset;
+        self.entries.push_back(entry);
+        self.next_offset += 1;
+        offset
+    }
+
+    fn get(&self, offset: u64) -> Option<&LogEntry> {
+        if offset < self.oldest_offset || offset >= self.next_offset {
+            return None;
+        }
+
+        let idx = (offset - self.oldest_offset) as usize;
+        self.entries.get(idx)
+    }
+
+    fn evict_head(&mut self, count: usize) -> usize {
+        let to_evict = count.min(self.entries.len());
+        for _ in 0..to_evict {
+            self.entries.pop_front();
+        }
+        self.oldest_offset += to_evict as u64;
+        to_evict
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn next_offset(&self) -> u64 {
+        self.next_offset
+    }
+
+    fn oldest_offset(&self) -> u64 {
+        self.oldest_offset
+    }
+
+    fn oldest_entry(&self) -> Option<&LogEntry> {
+        self.entries.front()
+    }
+
+    fn entries_cloned(&self) -> Vec<LogEntry> {
+        self.entries.iter().cloned().collect()
+    }
+}
+
+impl PartitionShard {
+    fn new(shard_id: u32) -> Self {
+        Self {
+            shard_id,
+            buffer: PartitionBuffer::new(),
             indexer_pos: 0,
             service_index: InvertedIndex::new(),
             host_index: InvertedIndex::new(),
         }
     }
 
-    /// Ingest a log entry. Appends to the shared ring buffer.
-    /// The entry is NOT queryable until `flush_indexer()` is called.
-    /// In production, this would be an atomic fetch_add — zero contention between writers.
-    pub fn ingest(&mut self, entry: LogEntry) -> u64 {
-        self.ring_buffer.push(entry)
+    fn from_restored(restored: RestoredShard) -> io::Result<Self> {
+        Ok(Self {
+            shard_id: restored.shard_id,
+            buffer: PartitionBuffer::from_snapshot(restored.next_offset, restored.entries)?,
+            indexer_pos: 0,
+            service_index: InvertedIndex::new(),
+            host_index: InvertedIndex::new(),
+        })
     }
 
-    /// Advance the indexer: process all entries between indexer_pos and write head.
-    /// Builds service and host indexes for newly ingested entries.
-    /// In production, this runs on a dedicated thread trailing behind writers.
-    pub fn flush_indexer(&mut self) {
-        let write_head = self.ring_buffer.next_offset();
+    fn ingest(&mut self, entry: LogEntry) -> u64 {
+        self.buffer.push(entry)
+    }
+
+    fn flush_indexer(&mut self, host_routes: &mut HashMap<String, BTreeSet<u32>>) {
+        let write_head = self.buffer.next_offset();
         while self.indexer_pos < write_head {
-            if let Some(entry) = self.ring_buffer.get(self.indexer_pos) {
+            if let Some(entry) = self.buffer.get(self.indexer_pos) {
                 self.service_index
                     .insert(&entry.service_name, self.indexer_pos);
                 self.host_index.insert(&entry.host_id, self.indexer_pos);
+                host_routes
+                    .entry(entry.host_id.clone())
+                    .or_default()
+                    .insert(self.shard_id);
             }
             self.indexer_pos += 1;
         }
     }
 
-    /// How many entries are ingested but not yet indexed.
-    pub fn indexer_lag(&self) -> u64 {
-        self.ring_buffer.next_offset() - self.indexer_pos
+    fn indexer_lag(&self) -> u64 {
+        self.buffer.next_offset() - self.indexer_pos
     }
 
-    /// Query by service name in time range [t1, t2].
-    pub fn query_by_service(&self, service: &str, t1: i64, t2: i64) -> QueryResult {
-        let offsets = self.service_index.get(service);
-        QueryResult {
-            entries: self.collect_entries(offsets, t1, t2),
-        }
+    fn query_by_service(&self, service: &str, t1: i64, t2: i64) -> Vec<LogEntry> {
+        self.collect_entries(self.service_index.get(service), t1, t2)
     }
 
-    /// Query by host id in time range [t1, t2].
-    pub fn query_by_host(&self, host: &str, t1: i64, t2: i64) -> QueryResult {
-        let offsets = self.host_index.get(host);
-        QueryResult {
-            entries: self.collect_entries(offsets, t1, t2),
-        }
+    fn query_by_host(&self, host: &str, t1: i64, t2: i64) -> Vec<LogEntry> {
+        self.collect_entries(self.host_index.get(host), t1, t2)
     }
 
-    /// Query by service + host in time range [t1, t2].
-    pub fn query_by_service_and_host(
+    fn query_by_service_and_host(
         &self,
         service: &str,
         host: &str,
         t1: i64,
         t2: i64,
-    ) -> QueryResult {
-        let Some(svc_offsets) = self.service_index.get(service) else {
-            return QueryResult { entries: vec![] };
+    ) -> Vec<LogEntry> {
+        let Some(service_offsets) = self.service_index.get(service) else {
+            return vec![];
         };
         let Some(host_offsets) = self.host_index.get(host) else {
-            return QueryResult { entries: vec![] };
+            return vec![];
         };
 
         let mut entries = Vec::new();
         let (mut i, mut j) = (0, 0);
-
-        while i < svc_offsets.len() && j < host_offsets.len() {
+        while i < service_offsets.len() && j < host_offsets.len() {
             use std::cmp::Ordering;
 
-            match svc_offsets[i].cmp(&host_offsets[j]) {
+            match service_offsets[i].cmp(&host_offsets[j]) {
                 Ordering::Less => i += 1,
                 Ordering::Greater => j += 1,
                 Ordering::Equal => {
-                    if let Some(entry) = self.ring_buffer.get(svc_offsets[i]) {
+                    if let Some(entry) = self.buffer.get(service_offsets[i]) {
                         if entry.timestamp >= t1 && entry.timestamp <= t2 {
                             entries.push(entry.clone());
                         }
@@ -118,89 +196,263 @@ impl ChironStore {
             }
         }
 
-        QueryResult { entries }
+        entries
     }
 
-    /// Resolve offsets to entries, filtering by time range.
     fn collect_entries(&self, offsets: Option<&[u64]>, t1: i64, t2: i64) -> Vec<LogEntry> {
         match offsets {
             None => vec![],
-            Some(offs) => offs
+            Some(offsets) => offsets
                 .iter()
-                .filter_map(|&o| {
-                    self.ring_buffer
-                        .get(o)
-                        .filter(|e| e.timestamp >= t1 && e.timestamp <= t2)
+                .filter_map(|&offset| {
+                    self.buffer
+                        .get(offset)
+                        .filter(|entry| entry.timestamp >= t1 && entry.timestamp <= t2)
                         .cloned()
                 })
                 .collect(),
         }
     }
 
-    /// Run eviction: evict oldest entries from the head until below capacity threshold.
-    /// With monotonically increasing timestamps, the oldest entries are always
-    /// the least relevant — no need for a separate eviction ordering structure.
-    pub fn run_eviction(&mut self, target_free_pct: f64) {
-        let target_len =
-            (self.ring_buffer.capacity() as f64 * (1.0 - target_free_pct)) as usize;
-
-        if self.ring_buffer.len() <= target_len {
-            return;
-        }
-
-        let to_evict = self.ring_buffer.len() - target_len;
-        self.ring_buffer.evict_head(to_evict);
-        self.service_index
-            .purge_below(self.ring_buffer.oldest_offset());
-        self.host_index
-            .purge_below(self.ring_buffer.oldest_offset());
+    fn len(&self) -> usize {
+        self.buffer.len()
     }
 
-    /// Periodic maintenance: flush indexer + run eviction.
+    fn evict_head(&mut self, count: usize) {
+        self.buffer.evict_head(count);
+        let oldest_offset = self.buffer.oldest_offset();
+        self.service_index.purge_below(oldest_offset);
+        self.host_index.purge_below(oldest_offset);
+    }
+
+    fn oldest_timestamp(&self) -> Option<i64> {
+        self.buffer.oldest_entry().map(|entry| entry.timestamp)
+    }
+}
+
+impl ChironStore {
+    pub fn new(capacity: usize) -> Self {
+        Self::with_shards(capacity, 1)
+    }
+
+    pub fn with_shards(total_capacity: usize, shard_count: usize) -> Self {
+        assert!(total_capacity > 0, "store capacity must be > 0");
+        assert!(shard_count > 0, "shard count must be > 0");
+
+        let shards = (0..shard_count)
+            .map(|shard_id| PartitionShard::new(shard_id as u32))
+            .collect();
+
+        Self {
+            shards,
+            host_routes: HashMap::new(),
+            total_capacity,
+        }
+    }
+
+    /// Append using the store's host-based sharding strategy.
+    pub fn ingest(&mut self, entry: LogEntry) -> u64 {
+        let shard_id = self.route_host_to_shard(&entry.host_id);
+        self.evict_while_full();
+        self.shards[shard_id].ingest(entry)
+    }
+
+    /// Append directly into the shard that corresponds to a Kafka partition.
+    pub fn ingest_partition(&mut self, partition_id: u32, entry: LogEntry) -> u64 {
+        let position = self.ensure_shard(partition_id);
+        self.evict_while_full();
+        self.shards[position].ingest(entry)
+    }
+
+    pub fn flush_indexer(&mut self) {
+        let host_routes = &mut self.host_routes;
+        for shard in &mut self.shards {
+            shard.flush_indexer(host_routes);
+        }
+    }
+
+    pub fn indexer_lag(&self) -> u64 {
+        self.shards.iter().map(PartitionShard::indexer_lag).sum()
+    }
+
+    pub fn query_by_service(&self, service: &str, t1: i64, t2: i64) -> QueryResult {
+        let mut entries = Vec::new();
+        for shard in &self.shards {
+            entries.extend(shard.query_by_service(service, t1, t2));
+        }
+        sort_entries(&mut entries);
+        QueryResult { entries }
+    }
+
+    pub fn query_by_host(&self, host: &str, t1: i64, t2: i64) -> QueryResult {
+        let mut entries = Vec::new();
+        for shard_idx in self.shard_positions_for_host(host) {
+            entries.extend(self.shards[shard_idx].query_by_host(host, t1, t2));
+        }
+        sort_entries(&mut entries);
+        QueryResult { entries }
+    }
+
+    pub fn query_by_service_and_host(
+        &self,
+        service: &str,
+        host: &str,
+        t1: i64,
+        t2: i64,
+    ) -> QueryResult {
+        let mut entries = Vec::new();
+        for shard_idx in self.shard_positions_for_host(host) {
+            entries.extend(
+                self.shards[shard_idx].query_by_service_and_host(service, host, t1, t2),
+            );
+        }
+        sort_entries(&mut entries);
+        QueryResult { entries }
+    }
+
+    /// Global oldest-first eviction across shards.
+    pub fn run_eviction(&mut self, target_free_pct: f64) {
+        let target_len = (self.capacity() as f64 * (1.0 - target_free_pct)) as usize;
+        while self.len() > target_len {
+            if !self.evict_global_oldest(1) {
+                break;
+            }
+        }
+    }
+
     pub fn tick(&mut self) {
         self.flush_indexer();
         self.run_eviction(0.2);
     }
 
     pub fn len(&self) -> usize {
-        self.ring_buffer.len()
+        self.shards.iter().map(PartitionShard::len).sum()
     }
 
     pub fn capacity(&self) -> usize {
-        self.ring_buffer.capacity()
+        self.total_capacity
     }
 
-    // --- Snapshot / Restore ---
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
 
-    /// Take a snapshot of the current ring buffer + kafka offsets to disk.
-    /// Writes atomically (tmp file + rename). Indexes are NOT included —
-    /// they are rebuilt from the ring buffer on restore via flush_indexer().
     pub fn save_snapshot(
         &self,
         path: &Path,
         kafka_offsets: &KafkaOffsets,
     ) -> io::Result<()> {
-        Snapshot::save(path, &self.ring_buffer, kafka_offsets)
+        let shards: Vec<_> = self
+            .shards
+            .iter()
+            .map(|shard| SnapshotShard {
+                shard_id: shard.shard_id,
+                next_offset: shard.buffer.next_offset(),
+                entries: shard.buffer.entries_cloned(),
+            })
+            .collect();
+
+        Snapshot::save_sharded(path, self.total_capacity, &shards, kafka_offsets)
     }
 
-    /// Restore from a snapshot file. Returns (ChironStore, KafkaOffsets).
-    /// The store's indexes are fully rebuilt from the ring buffer data.
-    /// Resume Kafka consumers from the returned offsets.
     pub fn from_snapshot(path: &Path) -> io::Result<(Self, KafkaOffsets)> {
-        let (ring_buffer, kafka_offsets) = Snapshot::load(path)?;
+        let (total_capacity, restored_shards, kafka_offsets) = Snapshot::load_sharded(path)?;
+        if restored_shards.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "snapshot must contain at least one shard",
+            ));
+        }
+
+        let mut shards = Vec::with_capacity(restored_shards.len());
+        for restored in restored_shards {
+            shards.push(PartitionShard::from_restored(restored)?);
+        }
+        shards.sort_by_key(|shard| shard.shard_id);
 
         let mut store = Self {
-            ring_buffer,
-            indexer_pos: 0,
-            service_index: InvertedIndex::new(),
-            host_index: InvertedIndex::new(),
+            shards,
+            host_routes: HashMap::new(),
+            total_capacity: total_capacity.max(1),
         };
-
-        // Rebuild indexes from restored ring buffer.
         store.flush_indexer();
 
         Ok((store, kafka_offsets))
     }
+
+    fn evict_while_full(&mut self) {
+        while self.len() >= self.total_capacity {
+            if !self.evict_global_oldest(1) {
+                break;
+            }
+        }
+    }
+
+    fn evict_global_oldest(&mut self, count: usize) -> bool {
+        let Some((shard_idx, _)) = self
+            .shards
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, shard)| shard.oldest_timestamp().map(|ts| (idx, ts)))
+            .min_by_key(|(_, ts)| *ts)
+        else {
+            return false;
+        };
+
+        self.shards[shard_idx].evict_head(count);
+        true
+    }
+
+    fn route_host_to_shard(&self, host: &str) -> usize {
+        if self.shards.len() == 1 {
+            return 0;
+        }
+
+        let mut hasher = DefaultHasher::new();
+        host.hash(&mut hasher);
+        (hasher.finish() as usize) % self.shards.len()
+    }
+
+    fn shard_positions_for_host(&self, host: &str) -> Vec<usize> {
+        if let Some(routes) = self.host_routes.get(host) {
+            let positions: Vec<_> = routes
+                .iter()
+                .filter_map(|shard_id| self.shard_position(*shard_id))
+                .collect();
+            if !positions.is_empty() {
+                return positions;
+            }
+        }
+
+        (0..self.shards.len()).collect()
+    }
+
+    fn shard_position(&self, shard_id: u32) -> Option<usize> {
+        self.shards.iter().position(|shard| shard.shard_id == shard_id)
+    }
+
+    fn ensure_shard(&mut self, shard_id: u32) -> usize {
+        if let Some(position) = self.shard_position(shard_id) {
+            return position;
+        }
+
+        let start = self.shards.len() as u32;
+        for id in start..=shard_id {
+            self.shards.push(PartitionShard::new(id));
+        }
+
+        self.shards.len() - 1
+    }
+}
+
+fn sort_entries(entries: &mut [LogEntry]) {
+    entries.sort_by(|a, b| {
+        a.timestamp
+            .cmp(&b.timestamp)
+            .then_with(|| a.host_id.cmp(&b.host_id))
+            .then_with(|| a.service_name.cmp(&b.service_name))
+            .then_with(|| a.message.cmp(&b.message))
+    });
 }
 
 #[cfg(test)]
@@ -225,11 +477,9 @@ mod tests {
         store.ingest(make_entry(20, "payment", "h1"));
         store.ingest(make_entry(30, "auth", "h2"));
 
-        // Not queryable yet — indexer hasn't run.
         let result = store.query_by_service("auth", 0, 100);
         assert!(result.entries.is_empty());
 
-        // Flush indexer.
         store.flush_indexer();
 
         let result = store.query_by_service("auth", 0, 100);
@@ -272,7 +522,7 @@ mod tests {
         store.flush_indexer();
 
         let result = store.query_by_service("svc", 10, 20);
-        assert_eq!(result.entries.len(), 3); // 10, 15, 20
+        assert_eq!(result.entries.len(), 3);
     }
 
     #[test]
@@ -302,30 +552,78 @@ mod tests {
     }
 
     #[test]
+    fn sharded_queries_route_by_host() {
+        let mut store = ChironStore::with_shards(12, 4);
+        store.ingest_partition(0, make_entry(10, "auth", "h0"));
+        store.ingest_partition(1, make_entry(20, "auth", "h1"));
+        store.ingest_partition(2, make_entry(30, "payments", "h2"));
+        store.ingest_partition(1, make_entry(40, "auth", "h1"));
+        store.flush_indexer();
+
+        let host_result = store.query_by_host("h1", 0, 100);
+        assert_eq!(host_result.entries.len(), 2);
+        assert!(host_result.entries.iter().all(|entry| entry.host_id == "h1"));
+
+        let service_result = store.query_by_service("auth", 0, 100);
+        assert_eq!(service_result.entries.len(), 3);
+
+        let combined = store.query_by_service_and_host("auth", "h1", 0, 100);
+        assert_eq!(combined.entries.len(), 2);
+    }
+
+    #[test]
+    fn sharded_eviction_drops_global_oldest_entries() {
+        let mut store = ChironStore::with_shards(4, 2);
+        store.ingest_partition(0, make_entry(10, "svc", "h0"));
+        store.ingest_partition(1, make_entry(20, "svc", "h1"));
+        store.ingest_partition(0, make_entry(30, "svc", "h0"));
+        store.ingest_partition(1, make_entry(40, "svc", "h1"));
+        store.ingest_partition(0, make_entry(50, "svc", "h0"));
+        store.flush_indexer();
+
+        let result = store.query_by_service("svc", 0, 100);
+        assert_eq!(result.entries.len(), 4);
+        assert_eq!(result.entries[0].timestamp, 20);
+    }
+
+    #[test]
+    fn global_capacity_budget_handles_hot_shard() {
+        let mut store = ChironStore::with_shards(12, 4);
+        for ts in 0..12 {
+            store.ingest_partition(0, make_entry(ts, "svc", "hot-host"));
+        }
+        store.flush_indexer();
+
+        let result = store.query_by_service("svc", 0, i64::MAX);
+        assert_eq!(result.entries.len(), 12);
+
+        store.tick();
+        let result = store.query_by_service("svc", 0, i64::MAX);
+        assert_eq!(result.entries.len(), 9);
+        assert_eq!(result.entries.first().unwrap().timestamp, 3);
+        assert_eq!(result.entries.last().unwrap().timestamp, 11);
+    }
+
+    #[test]
     fn snapshot_and_restore() {
         let dir = std::env::temp_dir().join("chiron_test_store_snapshot");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("store.snap");
 
-        // Build store, ingest, flush.
-        let mut store = ChironStore::new(1000);
-        store.ingest(make_entry(10, "auth", "h1"));
-        store.ingest(make_entry(20, "payment", "h2"));
-        store.ingest(make_entry(30, "auth", "h1"));
+        let mut store = ChironStore::with_shards(12, 3);
+        store.ingest_partition(0, make_entry(10, "auth", "h1"));
+        store.ingest_partition(1, make_entry(20, "payment", "h2"));
+        store.ingest_partition(0, make_entry(30, "auth", "h1"));
         store.flush_indexer();
 
-        // Set kafka offsets.
         let mut offsets = KafkaOffsets::new();
         offsets.set("logs", 0, 99999);
         offsets.set("logs", 1, 88888);
 
-        // Save snapshot.
         store.save_snapshot(&path, &offsets).unwrap();
 
-        // Restore from snapshot.
         let (restored, restored_offsets) = ChironStore::from_snapshot(&path).unwrap();
 
-        // Indexes should be rebuilt — queries should work immediately.
         let result = restored.query_by_service("auth", 0, 100);
         assert_eq!(result.entries.len(), 2);
 
@@ -335,7 +633,7 @@ mod tests {
         let result = restored.query_by_service_and_host("auth", "h1", 0, 100);
         assert_eq!(result.entries.len(), 2);
 
-        // Kafka offsets restored.
+        assert_eq!(restored.shard_count(), 3);
         assert_eq!(restored_offsets.get("logs", 0), Some(99999));
         assert_eq!(restored_offsets.get("logs", 1), Some(88888));
 

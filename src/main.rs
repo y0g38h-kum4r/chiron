@@ -60,9 +60,22 @@ fn main() {
 
     // --- Show Kafka consumer offsets ---
     println!("Kafka consumer offsets:");
-    for p in 0..num_partitions {
-        let off = stats.kafka_offsets.get("chiron-logs", p).unwrap_or(0);
-        println!("  chiron-logs/partition-{}: offset {}", p, off);
+    let mut printed_offsets = false;
+    let mut topics: Vec<_> = stats.kafka_offsets.inner().iter().collect();
+    topics.sort_by(|(left, _), (right, _)| left.cmp(right));
+    for (topic, partitions) in topics {
+        let mut ordered_partitions: Vec<_> = partitions.iter().collect();
+        ordered_partitions.sort_by_key(|(partition, _)| **partition);
+        for (partition, offset) in ordered_partitions {
+            println!("  {topic}/partition-{partition}: offset {offset}");
+            printed_offsets = true;
+        }
+    }
+    if !printed_offsets {
+        for p in 0..num_partitions {
+            let off = stats.kafka_offsets.get("chiron-logs", p).unwrap_or(0);
+            println!("  chiron-logs/partition-{}: offset {}", p, off);
+        }
     }
     println!();
 

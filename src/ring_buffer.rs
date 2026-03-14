@@ -1,3 +1,5 @@
+use std::io;
+
 use crate::log_entry::LogEntry;
 
 /// Fixed-capacity circular buffer for log entries.
@@ -16,6 +18,8 @@ pub struct RingBuffer {
 
 impl RingBuffer {
     pub fn new(capacity: usize) -> Self {
+        assert!(capacity > 0, "ring buffer capacity must be > 0");
+
         let mut buf = Vec::with_capacity(capacity);
         buf.resize_with(capacity, || None);
         Self {
@@ -93,8 +97,40 @@ impl RingBuffer {
         len: usize,
         entries: Vec<LogEntry>,
     ) -> Self {
-        assert!(entries.len() == len, "entry count must match len");
-        assert!(len <= capacity, "len must not exceed capacity");
+        Self::try_restore(capacity, global_offset, len, entries)
+            .expect("invalid ring buffer snapshot state")
+    }
+
+    pub fn try_restore(
+        capacity: usize,
+        global_offset: u64,
+        len: usize,
+        entries: Vec<LogEntry>,
+    ) -> io::Result<Self> {
+        if capacity == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ring buffer capacity must be > 0",
+            ));
+        }
+        if entries.len() != len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "entry count must match len",
+            ));
+        }
+        if len > capacity {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "len must not exceed capacity",
+            ));
+        }
+        if global_offset < len as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "global offset must be >= len",
+            ));
+        }
 
         let mut buf = Vec::with_capacity(capacity);
         buf.resize_with(capacity, || None);
@@ -109,13 +145,13 @@ impl RingBuffer {
 
         let write_pos = (global_offset % capacity as u64) as usize;
 
-        Self {
+        Ok(Self {
             buf,
             capacity,
             write_pos,
             len,
             global_offset,
-        }
+        })
     }
 
     /// Iterate over all live entries in order (oldest to newest).
@@ -125,6 +161,10 @@ impl RingBuffer {
             current: self.oldest_offset(),
             end: self.global_offset,
         }
+    }
+
+    pub fn oldest_entry(&self) -> Option<&LogEntry> {
+        self.iter().next().map(|(_, entry)| entry)
     }
 }
 

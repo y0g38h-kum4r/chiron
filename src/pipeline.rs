@@ -130,8 +130,12 @@ impl DummyService {
 pub fn run_pipeline(
     config: PipelineConfig,
 ) -> Result<(Arc<Mutex<ChironStore>>, PipelineStats), ChironKafkaError> {
-    let store = Arc::new(Mutex::new(ChironStore::new(config.ring_buffer_capacity)));
+    let store = Arc::new(Mutex::new(ChironStore::with_shards(
+        config.ring_buffer_capacity,
+        config.num_partitions as usize,
+    )));
     let producers_done = Arc::new(AtomicBool::new(false));
+    let consumers_done = Arc::new(AtomicBool::new(false));
     let max_indexer_lag = Arc::new(AtomicU64::new(0));
 
     let pipeline_start = Instant::now();
@@ -154,7 +158,7 @@ pub fn run_pipeline(
 
     // --- Spawn a background indexer to keep queries warm during ingestion ---
     let index_store = Arc::clone(&store);
-    let index_done = Arc::clone(&producers_done);
+    let index_done = Arc::clone(&consumers_done);
     let index_flush_interval = config.index_flush_interval;
     let index_lag_metric = Arc::clone(&max_indexer_lag);
     let indexer_thread = thread::spawn(move || {
@@ -228,6 +232,7 @@ pub fn run_pipeline(
             }
         }
     }
+    consumers_done.store(true, Ordering::SeqCst);
     let consume_duration = consume_start.elapsed();
     let index_flushes = indexer_thread
         .join()
@@ -249,9 +254,8 @@ pub fn run_pipeline(
 }
 
 /// Consumer loop for one consumer in the group.
-/// Polls records from Kafka, ingests into ChironStore, tracks offsets.
-/// Terminates when no new messages arrive for a sustained timeout period,
-/// indicating all producers are done.
+/// Records are routed into partition-local shards based on the partition id
+/// returned by Kafka rather than by the thread that happened to read them.
 fn consume_partition(
     brokers: &str,
     topic: &str,
@@ -261,7 +265,7 @@ fn consume_partition(
 ) -> Result<(u64, KafkaOffsets), ChironKafkaError> {
     let consumer = ChironConsumer::new(brokers, topic, group)?;
     let mut count = 0u64;
-    let mut batch = Vec::with_capacity(256);
+    let mut batch: Vec<(LogEntry, u32)> = Vec::with_capacity(256);
 
     let poll_timeout = Duration::from_millis(200);
     let idle_deadline = Duration::from_secs(5);
@@ -269,16 +273,16 @@ fn consume_partition(
 
     loop {
         match consumer.poll(poll_timeout) {
-            Ok(Some((entry, _partition, _offset))) => {
-                batch.push(entry);
+            Ok(Some((entry, partition, _offset))) => {
+                batch.push((entry, partition as u32));
                 count += 1;
                 last_message_time = Instant::now();
 
                 // Try to batch more.
                 while batch.len() < 256 {
                     match consumer.poll(Duration::from_millis(10)) {
-                        Ok(Some((entry, _, _))) => {
-                            batch.push(entry);
+                        Ok(Some((entry, partition, _))) => {
+                            batch.push((entry, partition as u32));
                             count += 1;
                             last_message_time = Instant::now();
                         }
@@ -287,16 +291,16 @@ fn consume_partition(
                     }
                 }
 
-                // Commit offsets.
-                consumer.commit()?;
-
-                // Ingest batch into store.
+                // Ingest batch into the partition-local shards first so a crash
+                // cannot acknowledge records that were never accepted locally.
                 {
                     let mut s = store.lock().unwrap();
-                    for entry in batch.drain(..) {
-                        s.ingest(entry);
+                    for (entry, partition) in batch.drain(..) {
+                        s.ingest_partition(partition, entry);
                     }
                 }
+
+                consumer.commit()?;
             }
             Ok(None) => {
                 // No message — quit once producers are done and the stream has been idle.
