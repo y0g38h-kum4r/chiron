@@ -1,6 +1,6 @@
 # ChironVision Log Buffer
 
-An in-memory, Kafka-backed log store for incident-style queries over recent observability data.
+An in-memory, Kafka-backed log store for incident-style queries over recent observability data, plus a small Go benchmark used for side-by-side query-path comparisons.
 
 ## Assumptions
 
@@ -121,7 +121,7 @@ Kafka remains the durable source of truth. The in-memory store is a fast query c
 
 `ChironStore::save_snapshot` writes a single **sharded snapshot file** containing:
 
-- snapshot magic `CHIRON02`
+- snapshot magic `CHIRON03`
 - shard count
 - for each shard:
   - shard id
@@ -165,12 +165,14 @@ src/
 ├── lib.rs               # Module declarations
 ├── main.rs              # Demo entrypoint
 ├── log_entry.rs         # LogEntry struct
-├── ring_buffer.rs       # Fixed-capacity buffer used by low-level helpers/tests
 ├── inverted_index.rs    # Local service/host posting lists
 ├── kafka.rs             # Kafka producer/consumer wrappers
 ├── pipeline.rs          # Kafka pipeline and background indexer
 ├── snapshot.rs          # Snapshot encoding/decoding
 └── chiron.rs            # Shard-aware ChironStore
+go_three_maps/
+├── go.mod               # Standalone Go module for the benchmark
+└── main.go              # In-memory Go benchmark with matching query semantics
 ```
 
 ## Usage
@@ -184,6 +186,23 @@ Kafka integration tests are ignored by default:
 
 ```bash
 cargo test --test e2e -- --ignored --nocapture
+```
+
+Release-mode load-style benchmarks:
+
+```bash
+cargo test --release --test load_e2e store_1m_ingest_and_10k_queries -- --ignored --nocapture
+```
+
+```bash
+cargo test --release --test e2e kafka_1m_ingest_and_10k_queries -- --ignored --nocapture
+```
+
+Go benchmark:
+
+```bash
+cd go_three_maps
+go run .
 ```
 
 If no broker is reachable at `localhost:9092`, the E2E tests skip with a message instead of failing noisily.
