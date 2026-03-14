@@ -60,6 +60,18 @@ The store also maintains a `host_routes` map while indexing so host-aware querie
 
 The current pipeline runs a background indexer thread that periodically calls `flush_indexer()` across all shards. Query freshness therefore depends on indexer lag.
 
+### Commit vs. Searchability
+
+In the Kafka pipeline, a consumer appends records into the in-memory shard buffer and only then commits the Kafka offset. The commit therefore means "accepted into the in-memory store," not "already visible in the indexes."
+
+That creates a small window where:
+
+- a record has been committed in Kafka
+- the record is present in the shard buffer
+- but `ByService` / `ByHost` / `ByServiceAndHost` may not return it yet because the background indexer has not flushed that shard
+
+On a clean run, the background indexer catches up before the pipeline exits. During live ingestion, though, queries are only as fresh as the current indexer lag.
+
 ## Read Path
 
 ### `ByService(service, t1, t2)`
@@ -141,6 +153,7 @@ That means:
 
 - snapshots are fully durable on disk once written
 - restore works correctly for the serialized state
+- Kafka commits can get ahead of both index visibility and snapshot durability
 - but a live snapshot is only as consistent as the caller's offset capture strategy
 
 For offline snapshots taken after ingestion stops, this is fine. For live streaming snapshots, this is still an area for future improvement.

@@ -19,6 +19,7 @@ pub struct ChironStore {
     shards: Vec<PartitionShard>,
     host_routes: HashMap<String, BTreeSet<u32>>,
     total_capacity: usize,
+    live_len: usize,
 }
 
 struct PartitionShard {
@@ -218,11 +219,16 @@ impl PartitionShard {
         self.buffer.len()
     }
 
-    fn evict_head(&mut self, count: usize) {
-        self.buffer.evict_head(count);
+    fn evict_head(&mut self, count: usize) -> usize {
+        let evicted = self.buffer.evict_head(count);
+        if evicted == 0 {
+            return 0;
+        }
+
         let oldest_offset = self.buffer.oldest_offset();
         self.service_index.purge_below(oldest_offset);
         self.host_index.purge_below(oldest_offset);
+        evicted
     }
 
     fn oldest_timestamp(&self) -> Option<i64> {
@@ -247,6 +253,7 @@ impl ChironStore {
             shards,
             host_routes: HashMap::new(),
             total_capacity,
+            live_len: 0,
         }
     }
 
@@ -254,14 +261,18 @@ impl ChironStore {
     pub fn ingest(&mut self, entry: LogEntry) -> u64 {
         let shard_id = self.route_host_to_shard(&entry.host_id);
         self.evict_while_full();
-        self.shards[shard_id].ingest(entry)
+        let offset = self.shards[shard_id].ingest(entry);
+        self.live_len += 1;
+        offset
     }
 
     /// Append directly into the shard that corresponds to a Kafka partition.
     pub fn ingest_partition(&mut self, partition_id: u32, entry: LogEntry) -> u64 {
         let position = self.ensure_shard(partition_id);
         self.evict_while_full();
-        self.shards[position].ingest(entry)
+        let offset = self.shards[position].ingest(entry);
+        self.live_len += 1;
+        offset
     }
 
     pub fn flush_indexer(&mut self) {
@@ -313,8 +324,8 @@ impl ChironStore {
     /// Global oldest-first eviction across shards.
     pub fn run_eviction(&mut self, target_free_pct: f64) {
         let target_len = (self.capacity() as f64 * (1.0 - target_free_pct)) as usize;
-        while self.len() > target_len {
-            if !self.evict_global_oldest(1) {
+        while self.live_len > target_len {
+            if self.evict_global_oldest(1) == 0 {
                 break;
             }
         }
@@ -326,7 +337,7 @@ impl ChironStore {
     }
 
     pub fn len(&self) -> usize {
-        self.shards.iter().map(PartitionShard::len).sum()
+        self.live_len
     }
 
     pub fn capacity(&self) -> usize {
@@ -374,21 +385,23 @@ impl ChironStore {
             shards,
             host_routes: HashMap::new(),
             total_capacity: total_capacity.max(1),
+            live_len: 0,
         };
+        store.live_len = store.shards.iter().map(PartitionShard::len).sum();
         store.flush_indexer();
 
         Ok((store, kafka_offsets))
     }
 
     fn evict_while_full(&mut self) {
-        while self.len() >= self.total_capacity {
-            if !self.evict_global_oldest(1) {
+        while self.live_len >= self.total_capacity {
+            if self.evict_global_oldest(1) == 0 {
                 break;
             }
         }
     }
 
-    fn evict_global_oldest(&mut self, count: usize) -> bool {
+    fn evict_global_oldest(&mut self, count: usize) -> usize {
         let Some((shard_idx, _)) = self
             .shards
             .iter()
@@ -396,11 +409,12 @@ impl ChironStore {
             .filter_map(|(idx, shard)| shard.oldest_timestamp().map(|ts| (idx, ts)))
             .min_by_key(|(_, ts)| *ts)
         else {
-            return false;
+            return 0;
         };
 
-        self.shards[shard_idx].evict_head(count);
-        true
+        let evicted = self.shards[shard_idx].evict_head(count);
+        self.live_len = self.live_len.saturating_sub(evicted);
+        evicted
     }
 
     fn route_host_to_shard(&self, host: &str) -> usize {
@@ -529,10 +543,12 @@ mod tests {
     fn indexer_lag_tracks_unindexed() {
         let mut store = ChironStore::new(1000);
         assert_eq!(store.indexer_lag(), 0);
+        assert_eq!(store.len(), 0);
 
         store.ingest(make_entry(1, "a", "h1"));
         store.ingest(make_entry(2, "b", "h2"));
         assert_eq!(store.indexer_lag(), 2);
+        assert_eq!(store.len(), 2);
 
         store.flush_indexer();
         assert_eq!(store.indexer_lag(), 0);
@@ -578,7 +594,9 @@ mod tests {
         store.ingest_partition(1, make_entry(20, "svc", "h1"));
         store.ingest_partition(0, make_entry(30, "svc", "h0"));
         store.ingest_partition(1, make_entry(40, "svc", "h1"));
+        assert_eq!(store.len(), 4);
         store.ingest_partition(0, make_entry(50, "svc", "h0"));
+        assert_eq!(store.len(), 4);
         store.flush_indexer();
 
         let result = store.query_by_service("svc", 0, 100);
@@ -623,6 +641,7 @@ mod tests {
         store.save_snapshot(&path, &offsets).unwrap();
 
         let (restored, restored_offsets) = ChironStore::from_snapshot(&path).unwrap();
+        assert_eq!(restored.len(), 3);
 
         let result = restored.query_by_service("auth", 0, 100);
         assert_eq!(result.entries.len(), 2);
