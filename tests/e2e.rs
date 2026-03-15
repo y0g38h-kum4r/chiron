@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chiron::chiron::ChironStore;
 use chiron::kafka::{ChironConsumer, ChironProducer};
-use chiron::log_entry::LogEntry;
+use chiron::log_entry::{LogEntry, SharedLogEntry};
 use chiron::snapshot::KafkaOffsets;
 
 const BROKERS: &str = "localhost:9092";
@@ -57,7 +57,7 @@ fn entry(ts: i64, svc: &str, host: &str) -> LogEntry {
     }
 }
 
-fn assert_nondecreasing_timestamps(entries: &[LogEntry]) {
+fn assert_nondecreasing_timestamps(entries: &[SharedLogEntry]) {
     assert!(
         entries
             .windows(2)
@@ -207,13 +207,13 @@ fn kafka_full_lifecycle() {
     // Query by service: "auth" → 3 hosts × 10 = 30.
     let result = store.query_by_service("auth", 0, i64::MAX);
     assert_eq!(result.entries.len(), 30);
-    assert!(result.entries.iter().all(|e| e.service_name == "auth"));
+    assert!(result.entries.iter().all(|e| &*e.service_name == "auth"));
     assert_nondecreasing_timestamps(&result.entries);
 
     // Query by host: "h1" → 3 services × 10 = 30.
     let result = store.query_by_host("h1", 0, i64::MAX);
     assert_eq!(result.entries.len(), 30);
-    assert!(result.entries.iter().all(|e| e.host_id == "h1"));
+    assert!(result.entries.iter().all(|e| &*e.host_id == "h1"));
     assert_nondecreasing_timestamps(&result.entries);
 
     // Query by service + host: "payment" on "h2" = 10.
@@ -223,7 +223,7 @@ fn kafka_full_lifecycle() {
         result
             .entries
             .iter()
-            .all(|e| e.service_name == "payment" && e.host_id == "h2")
+            .all(|e| &*e.service_name == "payment" && &*e.host_id == "h2")
     );
     assert_nondecreasing_timestamps(&result.entries);
 }
@@ -573,7 +573,7 @@ fn kafka_serialization_fidelity() {
     // Verify each entry survived Kafka JSON serialization/deserialization intact.
     let r = store.query_by_service("svc-with-dashes", 0, 0);
     assert_eq!(r.entries.len(), 1);
-    assert_eq!(r.entries[0].host_id, "host.with.dots");
+    assert_eq!(&*r.entries[0].host_id, "host.with.dots");
 
     let r = store.query_by_service("UPPERCASE", 0, i64::MAX);
     assert_eq!(r.entries.len(), 1);
@@ -724,7 +724,7 @@ fn kafka_sharded_store_roundtrip() {
 
     let h2 = store.query_by_host("h2", 0, i64::MAX);
     assert_eq!(h2.entries.len(), services.len() * 8);
-    assert!(h2.entries.iter().all(|e| e.host_id == "h2"));
+    assert!(h2.entries.iter().all(|e| &*e.host_id == "h2"));
     assert_nondecreasing_timestamps(&h2.entries);
 
     let payment_h1 = store.query_by_service_and_host("payment", "h1", 0, i64::MAX);
@@ -733,7 +733,7 @@ fn kafka_sharded_store_roundtrip() {
         payment_h1
             .entries
             .iter()
-            .all(|e| e.service_name == "payment" && e.host_id == "h1")
+            .all(|e| &*e.service_name == "payment" && &*e.host_id == "h1")
     );
     assert_nondecreasing_timestamps(&payment_h1.entries);
 

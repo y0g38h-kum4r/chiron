@@ -45,7 +45,7 @@ struct PartitionBuffer {
 }
 
 pub struct QueryResult {
-    pub entries: Vec<LogEntry>,
+    pub entries: Vec<SharedLogEntry>,
 }
 
 impl PartitionBuffer {
@@ -116,7 +116,15 @@ impl PartitionBuffer {
 
 impl PartitionShardState {
     fn ingest(&mut self, entry: SharedLogEntry) -> u64 {
-        self.buffer.push(entry)
+        let offset = self.buffer.push(entry);
+        // Index inline while we already hold the write lock — avoids
+        // accumulating indexer lag between background flush ticks.
+        if let Some(e) = self.buffer.get(offset) {
+            self.service_index.insert(&e.service_name, offset);
+            self.host_index.insert(&e.host_id, offset);
+        }
+        self.indexer_pos = self.buffer.next_offset();
+        offset
     }
 
     fn flush_indexer(&mut self) {
@@ -135,28 +143,15 @@ impl PartitionShardState {
         self.buffer.next_offset() - self.indexer_pos
     }
 
-    fn query_by_service(&self, service: &str, t1: i64, t2: i64) -> Vec<LogEntry> {
-        self.collect_owned_entries(self.service_index.get(service), t1, t2)
+    fn query_by_service(&self, service: &str, t1: i64, t2: i64) -> Vec<SharedLogEntry> {
+        self.collect_entries(self.service_index.get(service), t1, t2)
     }
 
-    fn query_by_host(&self, host: &str, t1: i64, t2: i64) -> Vec<LogEntry> {
-        self.collect_owned_entries(self.host_index.get(host), t1, t2)
+    fn query_by_host(&self, host: &str, t1: i64, t2: i64) -> Vec<SharedLogEntry> {
+        self.collect_entries(self.host_index.get(host), t1, t2)
     }
 
     fn query_by_service_and_host(
-        &self,
-        service: &str,
-        host: &str,
-        t1: i64,
-        t2: i64,
-    ) -> Vec<LogEntry> {
-        self.query_by_service_and_host_shared(service, host, t1, t2)
-            .iter()
-            .map(LogEntry::from)
-            .collect()
-    }
-
-    fn query_by_service_and_host_shared(
         &self,
         service: &str,
         host: &str,
@@ -193,14 +188,7 @@ impl PartitionShardState {
         entries
     }
 
-    fn collect_owned_entries(&self, offsets: Option<&[u64]>, t1: i64, t2: i64) -> Vec<LogEntry> {
-        self.collect_shared_entries(offsets, t1, t2)
-            .iter()
-            .map(LogEntry::from)
-            .collect()
-    }
-
-    fn collect_shared_entries(
+    fn collect_entries(
         &self,
         offsets: Option<&[u64]>,
         t1: i64,
@@ -290,11 +278,11 @@ impl PartitionShard {
         self.inner.read().unwrap().indexer_lag()
     }
 
-    fn query_by_service(&self, service: &str, t1: i64, t2: i64) -> Vec<LogEntry> {
+    fn query_by_service(&self, service: &str, t1: i64, t2: i64) -> Vec<SharedLogEntry> {
         self.inner.read().unwrap().query_by_service(service, t1, t2)
     }
 
-    fn query_by_host(&self, host: &str, t1: i64, t2: i64) -> Vec<LogEntry> {
+    fn query_by_host(&self, host: &str, t1: i64, t2: i64) -> Vec<SharedLogEntry> {
         self.inner.read().unwrap().query_by_host(host, t1, t2)
     }
 
@@ -304,7 +292,7 @@ impl PartitionShard {
         host: &str,
         t1: i64,
         t2: i64,
-    ) -> Vec<LogEntry> {
+    ) -> Vec<SharedLogEntry> {
         self.inner
             .read()
             .unwrap()
@@ -595,7 +583,7 @@ impl ChironStore {
     }
 }
 
-fn sort_entries(entries: &mut [LogEntry]) {
+fn sort_entries(entries: &mut [SharedLogEntry]) {
     entries.sort_unstable_by_key(|entry| entry.timestamp);
 }
 
@@ -622,7 +610,7 @@ mod tests {
         }
     }
 
-    fn assert_nondecreasing_timestamps(entries: &[LogEntry]) {
+    fn assert_nondecreasing_timestamps(entries: &[SharedLogEntry]) {
         assert!(
             entries
                 .windows(2)
@@ -639,15 +627,17 @@ mod tests {
         store.ingest(make_entry(20, "payment", "h1"));
         store.ingest(make_entry(30, "auth", "h2"));
 
+        // Entries are queryable immediately after ingest (inline indexing).
         let result = store.query_by_service("auth", 0, 100);
-        assert!(result.entries.is_empty());
+        assert_eq!(result.entries.len(), 2);
+        assert!(result.entries.iter().all(|e| &*e.service_name == "auth"));
+        assert_nondecreasing_timestamps(&result.entries);
 
+        // flush_indexer is still safe to call (idempotent).
         store.flush_indexer();
 
         let result = store.query_by_service("auth", 0, 100);
         assert_eq!(result.entries.len(), 2);
-        assert!(result.entries.iter().all(|e| e.service_name == "auth"));
-        assert_nondecreasing_timestamps(&result.entries);
     }
 
     #[test]
@@ -660,7 +650,7 @@ mod tests {
 
         let result = store.query_by_host("h1", 0, 100);
         assert_eq!(result.entries.len(), 2);
-        assert!(result.entries.iter().all(|e| e.host_id == "h1"));
+        assert!(result.entries.iter().all(|e| &*e.host_id == "h1"));
         assert_nondecreasing_timestamps(&result.entries);
     }
 
@@ -693,10 +683,10 @@ mod tests {
         store.ingest_partition(p0, make_entry(10, "auth", "host-0"));
         store.ingest_partition(p1, make_entry(20, "auth", "host-1"));
 
-        store.flush_indexer_shard(p1);
-
+        // With inline indexing both shards are already indexed.
         let h0 = store.query_by_host("host-0", 0, 100);
-        assert!(h0.entries.is_empty());
+        assert_eq!(h0.entries.len(), 1);
+        assert_eq!(h0.entries[0].timestamp, 10);
 
         let h1 = store.query_by_host("host-1", 0, 100);
         assert_eq!(h1.entries.len(), 1);
@@ -749,7 +739,8 @@ mod tests {
 
         store.ingest(make_entry(1, "a", "h1"));
         store.ingest(make_entry(2, "b", "h1"));
-        assert_eq!(store.indexer_lag(), 2);
+        // Inline indexing keeps lag at zero.
+        assert_eq!(store.indexer_lag(), 0);
         assert_eq!(store.len(), 2);
 
         store.flush_indexer();
@@ -784,7 +775,7 @@ mod tests {
 
         let host_result = store.query_by_host("h1", 0, 100);
         assert_eq!(host_result.entries.len(), 2);
-        assert!(host_result.entries.iter().all(|e| e.host_id == "h1"));
+        assert!(host_result.entries.iter().all(|e| &*e.host_id == "h1"));
 
         let service_result = store.query_by_service("auth", 0, 100);
         assert_eq!(service_result.entries.len(), 3);
@@ -857,7 +848,7 @@ mod tests {
             .entries
             .iter()
             .filter(|entry| entry.timestamp == 10)
-            .map(|entry| entry.host_id.as_str())
+            .map(|entry| &*entry.host_id)
             .collect();
         same_timestamp_hosts.sort_unstable();
         assert_eq!(same_timestamp_hosts, vec!["h1", "h2"]);
