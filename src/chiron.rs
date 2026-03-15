@@ -224,24 +224,17 @@ impl PartitionShard {
         };
 
         let scan_started = Instant::now();
-        let mut matching_offsets = Vec::with_capacity(offsets.len());
+        let mut entries = Vec::with_capacity(offsets.len());
         for &offset in offsets {
             if let Some(entry) = self.buffer.get(offset) {
                 if entry.timestamp >= t1 && entry.timestamp <= t2 {
-                    matching_offsets.push(offset);
+                    entries.push(entry.clone());
                 }
             }
         }
         let posting_list_scan = scan_started.elapsed();
 
-        let materialize_started = Instant::now();
-        let mut entries = Vec::with_capacity(matching_offsets.len());
-        for offset in matching_offsets {
-            if let Some(entry) = self.buffer.get(offset) {
-                entries.push(entry.clone());
-            }
-        }
-        let materialize = materialize_started.elapsed();
+        let materialize = Duration::ZERO;
 
         let hits = entries.len();
         let total = total_started.elapsed();
