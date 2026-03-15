@@ -456,13 +456,7 @@ impl ChironStore {
 }
 
 fn sort_entries(entries: &mut [LogEntry]) {
-    entries.sort_by(|a, b| {
-        a.timestamp
-            .cmp(&b.timestamp)
-            .then_with(|| a.host_id.cmp(&b.host_id))
-            .then_with(|| a.service_name.cmp(&b.service_name))
-            .then_with(|| a.message.cmp(&b.message))
-    });
+    entries.sort_unstable_by_key(|entry| entry.timestamp);
 }
 
 #[cfg(test)]
@@ -475,8 +469,16 @@ mod tests {
             service_name: svc.to_string(),
             host_id: host.to_string(),
             message: format!("log@{}", ts),
-            severity: 1,
         }
+    }
+
+    fn assert_nondecreasing_timestamps(entries: &[LogEntry]) {
+        assert!(
+            entries
+                .windows(2)
+                .all(|pair| pair[0].timestamp <= pair[1].timestamp),
+            "query results must be ordered by nondecreasing timestamp"
+        );
     }
 
     #[test]
@@ -495,6 +497,7 @@ mod tests {
         let result = store.query_by_service("auth", 0, 100);
         assert_eq!(result.entries.len(), 2);
         assert!(result.entries.iter().all(|e| e.service_name == "auth"));
+        assert_nondecreasing_timestamps(&result.entries);
     }
 
     #[test]
@@ -508,6 +511,7 @@ mod tests {
         let result = store.query_by_host("h1", 0, 100);
         assert_eq!(result.entries.len(), 2);
         assert!(result.entries.iter().all(|e| e.host_id == "h1"));
+        assert_nondecreasing_timestamps(&result.entries);
     }
 
     #[test]
@@ -533,6 +537,7 @@ mod tests {
 
         let result = store.query_by_service("svc", 10, 20);
         assert_eq!(result.entries.len(), 3);
+        assert_nondecreasing_timestamps(&result.entries);
     }
 
     #[test]
@@ -561,6 +566,7 @@ mod tests {
 
         let result = store.query_by_service("svc", 0, 100);
         assert_eq!(result.entries.len(), 100);
+        assert_nondecreasing_timestamps(&result.entries);
     }
 
     #[test]
@@ -583,9 +589,11 @@ mod tests {
 
         let service_result = store.query_by_service("auth", 0, 100);
         assert_eq!(service_result.entries.len(), 3);
+        assert_nondecreasing_timestamps(&service_result.entries);
 
         let combined = store.query_by_service_and_host("auth", "h1", 0, 100);
         assert_eq!(combined.entries.len(), 2);
+        assert_nondecreasing_timestamps(&combined.entries);
     }
 
     #[test]
@@ -603,6 +611,7 @@ mod tests {
         let result = store.query_by_service("svc", 0, 100);
         assert_eq!(result.entries.len(), 4);
         assert_eq!(result.entries[0].timestamp, 20);
+        assert_nondecreasing_timestamps(&result.entries);
     }
 
     #[test]
@@ -621,6 +630,29 @@ mod tests {
         assert_eq!(result.entries.len(), 9);
         assert_eq!(result.entries.first().unwrap().timestamp, 3);
         assert_eq!(result.entries.last().unwrap().timestamp, 11);
+        assert_nondecreasing_timestamps(&result.entries);
+    }
+
+    #[test]
+    fn query_results_only_guarantee_timestamp_order() {
+        let mut store = ChironStore::with_shards(8, 2);
+        store.ingest_partition(0, make_entry(10, "svc", "h1"));
+        store.ingest_partition(1, make_entry(10, "svc", "h2"));
+        store.ingest_partition(0, make_entry(11, "svc", "h3"));
+        store.flush_indexer();
+
+        let result = store.query_by_service("svc", 0, i64::MAX);
+        assert_eq!(result.entries.len(), 3);
+        assert_nondecreasing_timestamps(&result.entries);
+
+        let mut same_timestamp_hosts: Vec<_> = result
+            .entries
+            .iter()
+            .filter(|entry| entry.timestamp == 10)
+            .map(|entry| entry.host_id.as_str())
+            .collect();
+        same_timestamp_hosts.sort_unstable();
+        assert_eq!(same_timestamp_hosts, vec!["h1", "h2"]);
     }
 
     #[test]

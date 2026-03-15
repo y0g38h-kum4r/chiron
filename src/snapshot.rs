@@ -39,7 +39,7 @@ impl KafkaOffsets {
 
 // --- Binary serialization (no external deps) ---
 
-const SHARDED_SNAPSHOT_MAGIC: &[u8; 8] = b"CHIRON03";
+const SHARDED_SNAPSHOT_MAGIC: &[u8; 8] = b"CHIRON04";
 
 pub struct SnapshotShard {
     pub shard_id: u32,
@@ -153,7 +153,6 @@ fn write_entry(buf: &mut Vec<u8>, entry: &LogEntry) {
     write_string(buf, &entry.service_name);
     write_string(buf, &entry.host_id);
     write_string(buf, &entry.message);
-    buf.push(entry.severity);
 }
 
 fn write_kafka_offsets(buf: &mut Vec<u8>, kafka_offsets: &KafkaOffsets) {
@@ -192,14 +191,11 @@ fn read_entry(cursor: &mut &[u8]) -> io::Result<LogEntry> {
     let service_name = read_string(cursor)?;
     let host_id = read_string(cursor)?;
     let message = read_string(cursor)?;
-    let mut sev = [0u8; 1];
-    cursor.read_exact(&mut sev)?;
     Ok(LogEntry {
         timestamp,
         service_name,
         host_id,
         message,
-        severity: sev[0],
     })
 }
 
@@ -233,7 +229,6 @@ mod tests {
             service_name: svc.to_string(),
             host_id: host.to_string(),
             message: format!("msg@{}", ts),
-            severity: 2,
         }
     }
 

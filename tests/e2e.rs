@@ -50,14 +50,22 @@ fn unique_topic(prefix: &str) -> String {
 }
 
 /// Helper: create a LogEntry with the given parameters.
-fn entry(ts: i64, svc: &str, host: &str, severity: u8) -> LogEntry {
+fn entry(ts: i64, svc: &str, host: &str) -> LogEntry {
     LogEntry {
         timestamp: ts,
         service_name: svc.to_string(),
         host_id: host.to_string(),
         message: format!("{} on {} at t={}", svc, host, ts),
-        severity,
     }
+}
+
+fn assert_nondecreasing_timestamps(entries: &[LogEntry]) {
+    assert!(
+        entries
+            .windows(2)
+            .all(|pair| pair[0].timestamp <= pair[1].timestamp),
+        "query results must be ordered by nondecreasing timestamp"
+    );
 }
 
 /// Produce entries to Kafka, then consume them all into a ChironStore.
@@ -210,7 +218,6 @@ fn make_load_entry(
             "{} on svc {} host {} at ts {} with trace id abc-def-ghi-jkl-mno-pqr-stu",
             LOAD_ERROR_MESSAGES[msg_idx], service, host, ts
         ),
-        severity: (ts % 8) as u8,
     }
 }
 
@@ -469,7 +476,7 @@ fn kafka_full_lifecycle() {
     for svc in &services {
         for host in &hosts {
             for i in 0..entries_per_pair {
-                all_entries.push(entry(i as i64 * 100, svc, host, (i % 5) as u8));
+                all_entries.push(entry(i as i64 * 100, svc, host));
             }
         }
     }
@@ -499,11 +506,13 @@ fn kafka_full_lifecycle() {
     let result = store.query_by_service("auth", 0, i64::MAX);
     assert_eq!(result.entries.len(), 30);
     assert!(result.entries.iter().all(|e| e.service_name == "auth"));
+    assert_nondecreasing_timestamps(&result.entries);
 
     // Query by host: "h1" → 3 services × 10 = 30.
     let result = store.query_by_host("h1", 0, i64::MAX);
     assert_eq!(result.entries.len(), 30);
     assert!(result.entries.iter().all(|e| e.host_id == "h1"));
+    assert_nondecreasing_timestamps(&result.entries);
 
     // Query by service + host: "payment" on "h2" = 10.
     let result = store.query_by_service_and_host("payment", "h2", 0, i64::MAX);
@@ -514,6 +523,7 @@ fn kafka_full_lifecycle() {
             .iter()
             .all(|e| e.service_name == "payment" && e.host_id == "h2")
     );
+    assert_nondecreasing_timestamps(&result.entries);
 }
 
 // ---------------------------------------------------------------------------
@@ -534,8 +544,8 @@ fn kafka_time_range_filtering() {
     // payment: timestamps 150, 250, 350, 450, 550
     let mut entries = Vec::new();
     for i in 1..=5 {
-        entries.push(entry(i * 100, "auth", "h0", 1));
-        entries.push(entry(i * 100 + 50, "payment", "h0", 2));
+        entries.push(entry(i * 100, "auth", "h0"));
+        entries.push(entry(i * 100 + 50, "payment", "h0"));
     }
 
     let (mut store, consumed) = produce_and_consume(&topic, &group, &entries, 1000).unwrap();
@@ -551,14 +561,17 @@ fn kafka_time_range_filtering() {
             .iter()
             .all(|e| e.timestamp >= 200 && e.timestamp <= 400)
     );
+    assert_nondecreasing_timestamps(&result.entries);
 
     // payment in [200, 400] → 250, 350.
     let result = store.query_by_service("payment", 200, 400);
     assert_eq!(result.entries.len(), 2);
+    assert_nondecreasing_timestamps(&result.entries);
 
     // host h0 in [300, 350] → auth:300, payment:350 = 2.
     let result = store.query_by_host("h0", 300, 350);
     assert_eq!(result.entries.len(), 2);
+    assert_nondecreasing_timestamps(&result.entries);
 
     // Outside data range → empty.
     let result = store.query_by_service("auth", 600, 1000);
@@ -580,7 +593,7 @@ fn kafka_eviction_purges_indexes() {
     let group = format!("{}-group", topic);
 
     // Produce 50 entries, but store capacity is only 20.
-    let entries: Vec<LogEntry> = (0..50).map(|i| entry(i, "svc-a", "h0", 1)).collect();
+    let entries: Vec<LogEntry> = (0..50).map(|i| entry(i, "svc-a", "h0")).collect();
 
     let (mut store, consumed) = produce_and_consume(&topic, &group, &entries, 20).unwrap();
     assert_eq!(consumed, 50);
@@ -600,6 +613,7 @@ fn kafka_eviction_purges_indexes() {
     // Queries only return surviving entries.
     let result = store.query_by_service("svc-a", 0, i64::MAX);
     assert_eq!(result.entries.len(), remaining);
+    assert_nondecreasing_timestamps(&result.entries);
 
     // Oldest surviving entry should be recent.
     let min_ts = result.entries.iter().map(|e| e.timestamp).min().unwrap();
@@ -634,7 +648,7 @@ fn kafka_snapshot_roundtrip() {
     for svc in &services {
         for host in &hosts {
             for i in 0..20 {
-                entries.push(entry(1000 + i, svc, host, (i % 3) as u8));
+                entries.push(entry(1000 + i, svc, host));
             }
         }
     }
@@ -715,10 +729,10 @@ fn kafka_snapshot_after_eviction() {
     // Produce 60 entries, store capacity 30.
     let mut entries = Vec::new();
     for i in 0..30 {
-        entries.push(entry(i, "alpha", "h0", 1));
+        entries.push(entry(i, "alpha", "h0"));
     }
     for i in 30..60 {
-        entries.push(entry(i, "beta", "h0", 2));
+        entries.push(entry(i, "beta", "h0"));
     }
 
     let (mut store, consumed) = produce_and_consume(&topic, &group, &entries, 30).unwrap();
@@ -778,9 +792,7 @@ fn kafka_concurrent_producers() {
             let host = format!("host-{}", t % 2);
             for i in 0..entries_per_thread {
                 let ts = (t as i64 * 10_000) + i as i64;
-                producer
-                    .send(&entry(ts, &svc, &host, (i % 5) as u8))
-                    .unwrap();
+                producer.send(&entry(ts, &svc, &host)).unwrap();
             }
             producer.flush(Duration::from_secs(10)).unwrap();
         }));
@@ -849,21 +861,19 @@ fn kafka_serialization_fidelity() {
 
     // Produce entries with edge-case data.
     let entries = vec![
-        entry(0, "svc-with-dashes", "host.with.dots", 0),
-        entry(i64::MAX, "UPPERCASE", "MiXeD", 255),
+        entry(0, "svc-with-dashes", "host.with.dots"),
+        entry(i64::MAX, "UPPERCASE", "MiXeD"),
         LogEntry {
             timestamp: -1,
             service_name: "negative-ts".to_string(),
             host_id: "h0".to_string(),
             message: "special chars: !@#$%^&*(){}[]|\\;:'\",.<>?/`~".to_string(),
-            severity: 128,
         },
         LogEntry {
             timestamp: 42,
             service_name: "unicode".to_string(),
             host_id: "日本語ホスト".to_string(),
             message: "emoji 🔥 and ñ and ü".to_string(),
-            severity: 3,
         },
     ];
 
@@ -879,7 +889,6 @@ fn kafka_serialization_fidelity() {
     let r = store.query_by_service("UPPERCASE", 0, i64::MAX);
     assert_eq!(r.entries.len(), 1);
     assert_eq!(r.entries[0].timestamp, i64::MAX);
-    assert_eq!(r.entries[0].severity, 255);
 
     let r = store.query_by_service("negative-ts", i64::MIN, 0);
     assert_eq!(r.entries.len(), 1);
@@ -906,7 +915,7 @@ fn kafka_consumer_offset_tracking() {
     let group = format!("{}-group", topic);
 
     // Produce 20 entries.
-    let entries: Vec<LogEntry> = (0..20).map(|i| entry(i, "svc", "h0", 1)).collect();
+    let entries: Vec<LogEntry> = (0..20).map(|i| entry(i, "svc", "h0")).collect();
 
     let producer = ChironProducer::new(BROKERS, &topic).unwrap();
     for e in &entries {
@@ -1007,12 +1016,7 @@ fn kafka_sharded_store_roundtrip() {
     for svc in &services {
         for host in &hosts {
             for i in 0..8 {
-                entries.push(entry(
-                    1_000 + i + (entries.len() as i64),
-                    svc,
-                    host,
-                    (i % 4) as u8,
-                ));
+                entries.push(entry(1_000 + i + (entries.len() as i64), svc, host));
             }
         }
     }
@@ -1027,10 +1031,12 @@ fn kafka_sharded_store_roundtrip() {
 
     let auth = store.query_by_service("auth", 0, i64::MAX);
     assert_eq!(auth.entries.len(), hosts.len() * 8);
+    assert_nondecreasing_timestamps(&auth.entries);
 
     let h2 = store.query_by_host("h2", 0, i64::MAX);
     assert_eq!(h2.entries.len(), services.len() * 8);
     assert!(h2.entries.iter().all(|e| e.host_id == "h2"));
+    assert_nondecreasing_timestamps(&h2.entries);
 
     let payment_h1 = store.query_by_service_and_host("payment", "h1", 0, i64::MAX);
     assert_eq!(payment_h1.entries.len(), 8);
@@ -1040,6 +1046,7 @@ fn kafka_sharded_store_roundtrip() {
             .iter()
             .all(|e| e.service_name == "payment" && e.host_id == "h1")
     );
+    assert_nondecreasing_timestamps(&payment_h1.entries);
 
     let mut offsets = KafkaOffsets::new();
     offsets.set(&topic, 0, 111);
@@ -1094,7 +1101,7 @@ fn kafka_sharded_eviction_keeps_newest_global_entries() {
     let mut entries = Vec::new();
     for i in 0..12 {
         let host = format!("h{}", i % 4);
-        entries.push(entry(i, "svc", &host, 1));
+        entries.push(entry(i, "svc", &host));
     }
 
     let (mut store, consumed) =
@@ -1110,6 +1117,7 @@ fn kafka_sharded_eviction_keeps_newest_global_entries() {
     let max_ts = result.entries.iter().map(|e| e.timestamp).max().unwrap();
     assert_eq!(min_ts, 3);
     assert_eq!(max_ts, 11);
+    assert_nondecreasing_timestamps(&result.entries);
 
     let evicted = store.query_by_service("svc", 0, 2);
     assert!(evicted.entries.is_empty());

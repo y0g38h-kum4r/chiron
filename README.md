@@ -93,6 +93,9 @@ On a clean run, the background indexer catches up before the pipeline exits. Dur
 
 This means the current architecture accepts bounded fanout for `ByService`, while keeping `ByHost` and `ByServiceAndHost` narrow when routing information is available.
 
+All query APIs guarantee only nondecreasing timestamp order. Entries that share
+the same timestamp may appear in any relative order.
+
 ## Why Dynamic Buffers Per Shard?
 
 Sharding and local buffers solve different problems:
@@ -121,7 +124,7 @@ Kafka remains the durable source of truth. The in-memory store is a fast query c
 
 `ChironStore::save_snapshot` writes a single **sharded snapshot file** containing:
 
-- snapshot magic `CHIRON03`
+- snapshot magic `CHIRON04`
 - shard count
 - for each shard:
   - shard id

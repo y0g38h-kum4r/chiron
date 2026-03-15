@@ -7,5 +7,4 @@ pub struct LogEntry {
     pub service_name: String,
     pub host_id: String,
     pub message: String,
-    pub severity: u8,
 }

@@ -48,7 +48,6 @@ type Entry struct {
 	Service   string
 	Host      string
 	Message   string
-	Severity  uint8
 }
 
 type Store struct {
@@ -135,37 +134,28 @@ func cloneEntry(entry Entry) Entry {
 		Service:   strings.Clone(entry.Service),
 		Host:      strings.Clone(entry.Host),
 		Message:   strings.Clone(entry.Message),
-		Severity:  entry.Severity,
 	}
 }
 
 func sortEntries(entries []Entry) {
 	slices.SortFunc(entries, func(a, b Entry) int {
 		switch {
-		case a.Timestamp != b.Timestamp:
-			if a.Timestamp < b.Timestamp {
-				return -1
-			}
-			return 1
-		case a.Host != b.Host:
-			if a.Host < b.Host {
-				return -1
-			}
-			return 1
-		case a.Service != b.Service:
-			if a.Service < b.Service {
-				return -1
-			}
-			return 1
-		case a.Message != b.Message:
-			if a.Message < b.Message {
-				return -1
-			}
+		case a.Timestamp < b.Timestamp:
+			return -1
+		case a.Timestamp > b.Timestamp:
 			return 1
 		default:
 			return 0
 		}
 	})
+}
+
+func assertNondecreasingTimestamps(entries []Entry) {
+	for idx := 1; idx < len(entries); idx++ {
+		if entries[idx-1].Timestamp > entries[idx].Timestamp {
+			panic("query results must be ordered by nondecreasing timestamp")
+		}
+	}
 }
 
 func (s *Store) QueryByService(service string, t1, t2 int64) []Entry {
@@ -229,7 +219,6 @@ func makeLoadEntry(serviceIdx int, service string, hostIdx int, host string, ts 
 			host,
 			ts,
 		),
-		Severity: uint8(ts % 8),
 	}
 }
 
@@ -243,7 +232,6 @@ func consumeEntries(entries []Entry) uint64 {
 	var checksum uint64
 	for _, entry := range entries {
 		checksum += uint64(entry.Timestamp)
-		checksum += uint64(entry.Severity)
 		checksum += uint64(len(entry.Service))
 		checksum += uint64(len(entry.Host))
 		checksum += uint64(len(entry.Message))
@@ -269,6 +257,7 @@ func runQueries(store *Store, services, hosts []string) (int, uint64) {
 			service := services[queryIdx%serviceCount]
 			result := store.QueryByService(service, fullRangeStart, fullRangeEnd)
 			mustEqual("service full", len(result), serviceFullHits)
+			assertNondecreasingTimestamps(result)
 			totalHits += len(result)
 			expectedTotalHits += serviceFullHits
 			checksum += consumeEntries(result)
@@ -276,6 +265,7 @@ func runQueries(store *Store, services, hosts []string) (int, uint64) {
 			service := services[queryIdx%serviceCount]
 			result := store.QueryByService(service, midRangeStart, midRangeEnd)
 			mustEqual("service mid", len(result), serviceMidHits)
+			assertNondecreasingTimestamps(result)
 			totalHits += len(result)
 			expectedTotalHits += serviceMidHits
 			checksum += consumeEntries(result)
@@ -283,6 +273,7 @@ func runQueries(store *Store, services, hosts []string) (int, uint64) {
 			host := hosts[queryIdx%hostCount]
 			result := store.QueryByHost(host, fullRangeStart, fullRangeEnd)
 			mustEqual("host full", len(result), hostFullHits)
+			assertNondecreasingTimestamps(result)
 			totalHits += len(result)
 			expectedTotalHits += hostFullHits
 			checksum += consumeEntries(result)
@@ -290,6 +281,7 @@ func runQueries(store *Store, services, hosts []string) (int, uint64) {
 			host := hosts[queryIdx%hostCount]
 			result := store.QueryByHost(host, midRangeStart, midRangeEnd)
 			mustEqual("host mid", len(result), hostMidHits)
+			assertNondecreasingTimestamps(result)
 			totalHits += len(result)
 			expectedTotalHits += hostMidHits
 			checksum += consumeEntries(result)
@@ -303,6 +295,7 @@ func runQueries(store *Store, services, hosts []string) (int, uint64) {
 				fullRangeEnd,
 			)
 			mustEqual("pair full", len(result), pairFullHits)
+			assertNondecreasingTimestamps(result)
 			totalHits += len(result)
 			expectedTotalHits += pairFullHits
 			checksum += consumeEntries(result)
@@ -316,6 +309,7 @@ func runQueries(store *Store, services, hosts []string) (int, uint64) {
 				narrowRangeEnd,
 			)
 			mustEqual("pair narrow", len(result), pairNarrowHits)
+			assertNondecreasingTimestamps(result)
 			totalHits += len(result)
 			expectedTotalHits += pairNarrowHits
 			checksum += consumeEntries(result)
@@ -330,6 +324,8 @@ func assertLiveQueryResult(entries []Entry, service string, checkService bool, h
 	if len(entries) > maxExpected {
 		panic(fmt.Sprintf("live query returned too many rows: got %d, max %d", len(entries), maxExpected))
 	}
+
+	assertNondecreasingTimestamps(entries)
 
 	for _, entry := range entries {
 		if entry.Timestamp < t1 || entry.Timestamp > t2 {

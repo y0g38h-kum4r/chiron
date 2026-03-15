@@ -104,7 +104,6 @@ impl DummyService {
                 service_name: self.service_name.clone(),
                 host_id: self.host_id.clone(),
                 message: format!("{} on {} event {}", self.service_name, self.host_id, i),
-                severity: (i % 5) as u8,
             };
             self.producer.send(&entry)?;
         }
