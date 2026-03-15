@@ -1,4 +1,4 @@
-# ChironVision Log Buffer
+# Chiron Log Buffer
 
 An in-memory, Kafka-backed log store for incident-style queries over recent observability data
 
