@@ -7,7 +7,7 @@ An in-memory, Kafka-backed log store for incident-style queries over recent obse
 1. **Timestamps are roughly monotonic.** Logs arrive mostly in order, with only small jitter.
 2. **Host-scoped queries are the primary query paths.** `ByHost` is the hottest path, `ByServiceAndHost` is the next most common narrowing query, and `ByService` is a broader fleet-wide query that can afford fanout.
 3. **Noisy hosts should mostly pay their own retention cost.** When one shard gets much hotter than the rest, it should preferentially shed its own older data instead of pushing out quieter shards.
-4. **Small indexing lag is acceptable.** Newly ingested records may become queryable a short time after they are accepted.
+4. **Freshness on the live path matters.** Newly ingested records are indexed inline so accepted records are queryable immediately instead of waiting on a background flush tick.
 
 ## Architecture: Partition-Local Shards
 
@@ -25,15 +25,15 @@ This keeps the storage model aligned with Kafka's partitioning and makes the com
 
 ### Current Implementation Caveat
 
-The store is shard-aware internally, but the implementation is still a hybrid rather than a fully independent per-shard system. Today:
+The store is shard-aware end-to-end now, but a few control-plane pieces are still coordinated centrally. Today:
 
 - records are routed to partition-local shards
-- indexes are partition-local
-- queries can avoid unnecessary fanout
-- eviction is shard-local in effect, but triggered against a store-level occupancy budget
-- the pipeline still wraps the top-level `ChironStore` in one `Mutex`
+- shard buffers and indexes sit behind per-shard locks
+- host-scoped queries use deterministic `partition_for_host(...)` routing instead of a mutable routing table
+- eviction is shard-local in effect, but still triggered against a store-level occupancy budget
+- snapshot orchestration and some capacity bookkeeping remain store-scoped
 
-So the data path is shard-aware, but the control path is still coordinated centrally in the current prototype.
+So the hot data path is shard-local, while a small amount of lifecycle and capacity coordination still lives at the store level.
 
 ## Write Path
 
@@ -59,35 +59,30 @@ Each shard maintains local inverted indexes:
 - `service_name -> [local shard offsets]`
 - `host_id -> [local shard offsets]`
 
-The store also maintains a `host_routes` map on ingest so host-scoped queries can go straight to the single shard that owns that host even before indexing catches up.
-
 The intended invariant is strict: a given `host_id` must never appear in multiple shards. If ingest or recovery observes the same host in different shards, the store treats that as a bug and fails fast.
 
-The current pipeline runs a background indexer thread that periodically calls `flush_indexer()` across all shards. The indexing work itself is shard-local, and the store also exposes `flush_indexer_shard(shard_id)` for targeted flushes. Query freshness therefore still depends on indexer lag.
+Host-scoped queries do not need a mutable routing table anymore. They compute the owning shard directly with `partition_for_host(host_id, shard_count)`, so routing stays aligned with the producer-side Kafka partitioning rule.
+
+Each shard indexes accepted records inline while already holding its write lock, so the common ingest path does not accumulate index lag. The store still exposes `flush_indexer()` and `flush_indexer_shard(shard_id)`, but they are now mostly compatibility and recovery helpers.
+
+The demo pipeline and `e2e_bench` still carry a background indexer thread that periodically calls `flush_indexer()`. With inline indexing in place, that loop is largely redundant and should be removed unless you want to keep it as a defensive no-op.
 
 ### Commit vs. Searchability
 
-In the Kafka pipeline, a consumer appends records into the in-memory shard buffer and only then commits the Kafka offset. The commit therefore means "accepted into the in-memory store," not "already visible in the indexes."
+In the Kafka pipeline, a consumer appends records into the in-memory shard buffer, indexes them inline, and only then commits the Kafka offset. The commit therefore means "accepted into the in-memory store and visible to queries on the live path."
 
-That creates a small window where:
-
-- a record has been committed in Kafka
-- the record is present in the shard buffer
-- the host route is already known
-- but `ByService` / `ByHost` / `ByServiceAndHost` may not return it yet because the background indexer has not flushed that shard
-
-On a clean run, the background indexer catches up before the pipeline exits. During live ingestion, though, queries are only as fresh as the current indexer lag.
+`flush_indexer()` still matters for restore flows because snapshots persist buffered entries, not materialized indexes. On the live ingest path, though, query freshness no longer depends on a background flush cadence.
 
 ## Read Path
 
 ### `ByHost(host, t1, t2)`
 
-- use `host_routes` when available to query only the known shard for that host
-- fall back to fanout only when the host has never been seen locally or routing metadata is otherwise unavailable
+- compute the owning shard directly with `partition_for_host(host, shard_count)`
+- query only that shard's local host index
 
 ### `ByServiceAndHost(service, host, t1, t2)`
 
-- use `host_routes` to narrow to the relevant host shard first
+- compute the owning shard directly with `partition_for_host(host, shard_count)`
 - intersect the local service and host posting lists inside that shard
 
 ### `ByService(service, t1, t2)`
@@ -100,6 +95,12 @@ This means the current architecture is intentionally optimized for `ByHost` firs
 
 All query APIs guarantee only nondecreasing timestamp order. Entries that share
 the same timestamp may appear in any relative order.
+
+### Query Result Shape
+
+`QueryResult` returns `Vec<SharedLogEntry>` on purpose. That keeps the hot path zero-copy and avoids re-allocating `service_name`, `host_id`, and `message` strings for every match.
+
+That result shape is best treated as an internal-performance API. If you want a stable external contract, convert to owned `LogEntry` values or protobuf/gRPC response messages at the service boundary instead of freezing `SharedLogEntry` into the public surface area.
 
 ## Capacity Model
 
@@ -153,10 +154,9 @@ The snapshot write path is durable:
 Recovery does the following:
 
 1. Load every shard from the snapshot file.
-2. Rebuild `host_routes` from the buffered shard contents.
-3. Rebuild shard-local indexes by calling `flush_indexer()`.
-4. Restore Kafka offsets from the snapshot.
-5. Resume consumers from those offsets and replay forward.
+2. Rebuild shard-local indexes by calling `flush_indexer()`.
+3. Restore Kafka offsets from the snapshot.
+4. Resume consumers from those offsets and replay forward.
 
 ### Important Snapshot Limitation
 
@@ -180,7 +180,7 @@ src/
 ├── log_entry.rs         # Owned API LogEntry + shared-string store entry type
 ├── inverted_index.rs    # Local service/host posting lists
 ├── kafka.rs             # Kafka producer/consumer wrappers
-├── pipeline.rs          # Kafka pipeline and background indexer
+├── pipeline.rs          # Kafka pipeline (still includes a legacy indexer loop)
 ├── snapshot.rs          # Snapshot encoding/decoding
 └── chiron.rs            # Shard-aware ChironStore
 go_three_maps/
@@ -195,7 +195,11 @@ cargo run
 cargo test
 ```
 
-Store-only Rust benchmark:
+Kafka-backed end-to-end benchmark:
+
+```bash
+cargo run --release --bin e2e_bench
+```
 
 Kafka integration tests are ignored by default:
 
@@ -229,7 +233,7 @@ The local demo reads these environment variables:
 
 - `CHIRON_NUM_PARTITIONS`: Kafka topic partition count and shard count used by the pipeline. Default: `4`
 - `CHIRON_RING_BUFFER_CAPACITY`: total in-memory capacity distributed across shards. Default: `100000`
-- `CHIRON_INDEX_FLUSH_INTERVAL_MS`: background indexer flush interval in milliseconds. Default: `50`
+- `CHIRON_INDEX_FLUSH_INTERVAL_MS`: legacy background indexer flush interval in milliseconds. Default: `50`
 
 Example:
 
@@ -242,3 +246,5 @@ cargo run
 ```
 
 `docker-compose.yml` also uses `CHIRON_NUM_PARTITIONS` for Kafka's `KAFKA_NUM_PARTITIONS`, so keeping that env var aligned makes the demo behavior more predictable.
+
+`CHIRON_INDEX_FLUSH_INTERVAL_MS` is now mostly a compatibility knob. Since ingest indexes inline, changing it should have little to no effect on live-query freshness, and removing the background indexer thread entirely would simplify the benchmark path.
