@@ -5,8 +5,8 @@ An in-memory, Kafka-backed log store for incident-style queries over recent obse
 ## Assumptions
 
 1. **Timestamps are roughly monotonic.** Logs arrive mostly in order, with only small jitter.
-2. **`ByService` and `ByHost` are both primary query paths.** `ByServiceAndHost` is a narrower confirmation query built on top of them.
-3. **Oldest data is least relevant.** Eviction should prefer the oldest entries first.
+2. **Host-scoped queries are the primary query paths.** `ByHost` is the hottest path, `ByServiceAndHost` is the next most common narrowing query, and `ByService` is a broader fleet-wide query that can afford fanout.
+3. **Noisy hosts should mostly pay their own retention cost.** When one shard gets much hotter than the rest, it should preferentially shed its own older data instead of pushing out quieter shards.
 4. **Small indexing lag is acceptable.** Newly ingested records may become queryable a short time after they are accepted.
 
 ## Architecture: Partition-Local Shards
@@ -17,20 +17,23 @@ The store is organized as **partition-local shards**. Each shard owns:
 - its own service index
 - its own host index
 - its own indexer position
+- its own persisted capacity share for snapshot/restore
 
 In the Kafka pipeline, the store is created with one shard per Kafka partition. Consumed records are routed into the shard for the **actual Kafka partition returned by the broker**.
 
-This keeps the storage model aligned with Kafka's partitioning and makes host-routed queries cheap when `host_id` is the partitioning key.
+This keeps the storage model aligned with Kafka's partitioning and makes the common host-routed queries cheap when `host_id` is the partitioning key.
 
 ### Current Implementation Caveat
 
-The store is shard-aware internally, but the current pipeline still wraps the top-level `ChironStore` in one `Mutex`. So:
+The store is shard-aware internally, but the implementation is still a hybrid rather than a fully independent per-shard system. Today:
 
 - records are routed to partition-local shards
 - indexes are partition-local
 - queries can avoid unnecessary fanout
+- eviction is shard-local in effect, but triggered against a store-level occupancy budget
+- the pipeline still wraps the top-level `ChironStore` in one `Mutex`
 
-but ingestion is still coordinated through one top-level lock in the current prototype.
+So the data path is shard-aware, but the control path is still coordinated centrally in the current prototype.
 
 ## Write Path
 
@@ -56,7 +59,9 @@ Each shard maintains local inverted indexes:
 - `service_name -> [local shard offsets]`
 - `host_id -> [local shard offsets]`
 
-The store also maintains a `host_routes` map while indexing so host-aware queries can usually go straight to the shard or shards that actually contain that host.
+The store also maintains a `host_routes` map while indexing so host-scoped queries can go straight to the single shard that owns that host.
+
+The intended invariant is strict: a given `host_id` must never appear in multiple shards. If indexing observes the same host in different shards, the store treats that as a bug and fails fast.
 
 The current pipeline runs a background indexer thread that periodically calls `flush_indexer()` across all shards. Query freshness therefore depends on indexer lag.
 
@@ -74,47 +79,47 @@ On a clean run, the background indexer catches up before the pipeline exits. Dur
 
 ## Read Path
 
+### `ByHost(host, t1, t2)`
+
+- use `host_routes` when available to query only the known shard for that host
+- fall back to fanout if the host has not been indexed yet
+
+### `ByServiceAndHost(service, host, t1, t2)`
+
+- use `host_routes` to narrow to the relevant host shard first
+- intersect the local service and host posting lists inside that shard
+
 ### `ByService(service, t1, t2)`
 
 - fan out across shards
 - query each shard's local service index
 - merge and sort matching entries by timestamp
 
-### `ByHost(host, t1, t2)`
-
-- use `host_routes` when available to query only known shard(s) for that host
-- fall back to fanout if the host has not been indexed yet
-
-### `ByServiceAndHost(service, host, t1, t2)`
-
-- use `host_routes` to narrow to the relevant shard(s)
-- intersect the local service and host posting lists inside each shard
-- merge the results
-
-This means the current architecture accepts bounded fanout for `ByService`, while keeping `ByHost` and `ByServiceAndHost` narrow when routing information is available.
+This means the current architecture is intentionally optimized for `ByHost` first, then `ByServiceAndHost`, while accepting bounded fanout for broader `ByService` queries.
 
 All query APIs guarantee only nondecreasing timestamp order. Entries that share
 the same timestamp may appear in any relative order.
 
-## Why Dynamic Buffers Per Shard?
+## Capacity Model
 
-Sharding and local buffers solve different problems:
+The current store still admits writes against one store-level budget, but it carries shard-level capacity metadata too.
 
-- **Sharding** gives partition-local ownership and bounded fanout.
-- **Dynamic shard-local buffers** keep append order and local offsets while letting hot shards borrow more of the global live-entry budget.
+- `with_shards(total_capacity, shard_count)` divides the configured capacity into per-shard shares
+- those shard capacities are persisted in snapshots and reconstructed on restore
+- runtime admission is still checked against the store-wide occupancy, not against a hard per-shard quota
+- that means hot shards can temporarily consume more of the live dataset until eviction runs
 
-The current store does **not** slice capacity evenly across shards anymore. Instead:
-
-- the store has one global live-entry budget
-- hot shards can temporarily hold more entries than cold shards
-- eviction still happens globally by oldest timestamp
-- partition-local indexes stay intact
+This is why the code still has both shard-local state and a top-level notion of total occupancy: the layout is shard-based, but admission control has not been fully pushed down to independent shard budgets.
 
 ## Eviction
 
-Eviction remains **oldest-first**, but it is now computed across shards.
+Eviction remains **oldest-first within a shard**, but it is now biased toward the shard creating the pressure.
 
-The store compares the oldest live timestamp in each shard and repeatedly evicts from the globally oldest shard until the target capacity is reached. This preserves the "oldest data is least relevant" policy even though data is spread across multiple shard-local buffers.
+When a write arrives and the store is already full, the target shard evicts its own oldest entry first. That means a noisy host mostly overwrites its own older history instead of displacing quieter hosts.
+
+If the target shard cannot shed data, the store falls back to trimming the fullest shard. Background maintenance follows the same bias: it repeatedly trims the fullest shard first instead of comparing timestamps globally across all shards.
+
+This retention policy is intentionally different from "keep the newest cluster-wide data at all costs." It favors host isolation over perfect global recency.
 
 ## Durability: Kafka Replay + Sharded Snapshots
 
@@ -124,13 +129,16 @@ Kafka remains the durable source of truth. The in-memory store is a fast query c
 
 `ChironStore::save_snapshot` writes a single **sharded snapshot file** containing:
 
-- snapshot magic `CHIRON04`
+- snapshot magic `CHIRON05`
 - shard count
 - for each shard:
   - shard id
+  - shard capacity
   - next local offset
   - live entries in oldest-to-newest order
 - Kafka offsets supplied by the caller
+
+The loader still accepts older `CHIRON04` snapshots and reconstructs shard capacities from the legacy total-capacity header.
 
 The snapshot write path is durable:
 

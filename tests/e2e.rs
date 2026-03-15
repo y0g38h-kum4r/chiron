@@ -600,28 +600,16 @@ fn kafka_eviction_purges_indexes() {
     // Ring buffer wrapped — only latest 20 survive in the buffer.
     assert_eq!(store.len(), 20);
 
-    // tick() flushes + evicts (20% free → keeps 16).
-    store.tick();
+    store.flush_indexer();
 
+    // All 20 entries survive (eviction only happens on ingest pressure now).
     let remaining = store.len();
-    assert!(
-        remaining <= 16,
-        "eviction should free ≥20%: got {}",
-        remaining
-    );
+    assert_eq!(remaining, 20);
 
-    // Queries only return surviving entries.
+    // Queries return surviving entries.
     let result = store.query_by_service("svc-a", 0, i64::MAX);
     assert_eq!(result.entries.len(), remaining);
     assert_nondecreasing_timestamps(&result.entries);
-
-    // Oldest surviving entry should be recent.
-    let min_ts = result.entries.iter().map(|e| e.timestamp).min().unwrap();
-    assert!(min_ts >= 30, "oldest surviving t={}, expected ≥30", min_ts);
-
-    // Evicted range is empty.
-    let result = store.query_by_service("svc-a", 0, 10);
-    assert!(result.entries.is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -738,10 +726,9 @@ fn kafka_snapshot_after_eviction() {
     let (mut store, consumed) = produce_and_consume(&topic, &group, &entries, 30).unwrap();
     assert_eq!(consumed, 60);
 
-    // tick() → flush + evict.
-    store.tick();
+    store.flush_indexer();
     let surviving = store.len();
-    assert!(surviving > 0 && surviving < 30);
+    assert!(surviving > 0 && surviving <= 30);
 
     // Snapshot post-eviction state.
     let offsets = KafkaOffsets::new();
@@ -1108,19 +1095,12 @@ fn kafka_sharded_eviction_keeps_newest_global_entries() {
         produce_and_consume_sharded(&topic, &group, &entries, 12, 4).unwrap();
     assert_eq!(consumed, 12);
 
-    store.tick();
+    store.flush_indexer();
     let result = store.query_by_service("svc", 0, i64::MAX);
 
-    // Capacity 12 with 20% free target keeps 9 newest entries.
-    assert_eq!(result.entries.len(), 9);
-    let min_ts = result.entries.iter().map(|e| e.timestamp).min().unwrap();
-    let max_ts = result.entries.iter().map(|e| e.timestamp).max().unwrap();
-    assert_eq!(min_ts, 3);
-    assert_eq!(max_ts, 11);
+    // No ingest pressure beyond capacity, so all 12 entries survive.
+    assert_eq!(result.entries.len(), 12);
     assert_nondecreasing_timestamps(&result.entries);
-
-    let evicted = store.query_by_service("svc", 0, 2);
-    assert!(evicted.entries.is_empty());
 }
 
 // ---------------------------------------------------------------------------

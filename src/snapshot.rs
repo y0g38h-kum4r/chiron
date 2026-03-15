@@ -39,16 +39,19 @@ impl KafkaOffsets {
 
 // --- Binary serialization (no external deps) ---
 
-const SHARDED_SNAPSHOT_MAGIC: &[u8; 8] = b"CHIRON04";
+const SHARDED_SNAPSHOT_MAGIC_V1: &[u8; 8] = b"CHIRON04";
+const SHARDED_SNAPSHOT_MAGIC_V2: &[u8; 8] = b"CHIRON05";
 
 pub struct SnapshotShard {
     pub shard_id: u32,
+    pub capacity: usize,
     pub next_offset: u64,
     pub entries: Vec<LogEntry>,
 }
 
 pub struct RestoredShard {
     pub shard_id: u32,
+    pub capacity: usize,
     pub next_offset: u64,
     pub entries: Vec<LogEntry>,
 }
@@ -60,16 +63,15 @@ pub struct Snapshot;
 impl Snapshot {
     pub fn save_sharded(
         path: &Path,
-        total_capacity: usize,
         shards: &[SnapshotShard],
         kafka_offsets: &KafkaOffsets,
     ) -> io::Result<()> {
         let mut buf = Vec::new();
-        buf.extend_from_slice(SHARDED_SNAPSHOT_MAGIC);
-        write_u64(&mut buf, total_capacity as u64);
+        buf.extend_from_slice(SHARDED_SNAPSHOT_MAGIC_V2);
         write_u32(&mut buf, shards.len() as u32);
         for shard in shards {
             write_u32(&mut buf, shard.shard_id);
+            write_u64(&mut buf, shard.capacity as u64);
             write_u64(&mut buf, shard.next_offset);
             write_u64(&mut buf, shard.entries.len() as u64);
             for entry in &shard.entries {
@@ -81,40 +83,74 @@ impl Snapshot {
         durable_replace(path, &buf)
     }
 
-    pub fn load_sharded(path: &Path) -> io::Result<(usize, Vec<RestoredShard>, KafkaOffsets)> {
+    pub fn load_sharded(path: &Path) -> io::Result<(Vec<RestoredShard>, KafkaOffsets)> {
         let data = fs::read(path)?;
         let mut cursor = &data[..];
 
         let mut magic = [0u8; 8];
         cursor.read_exact(&mut magic)?;
-        if &magic != SHARDED_SNAPSHOT_MAGIC {
+        let (shards, kafka_offsets) = if &magic == SHARDED_SNAPSHOT_MAGIC_V1 {
+            load_sharded_v1(&mut cursor)?
+        } else if &magic == SHARDED_SNAPSHOT_MAGIC_V2 {
+            load_sharded_v2(&mut cursor)?
+        } else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid sharded snapshot magic",
             ));
-        }
+        };
 
-        let total_capacity = read_u64(&mut cursor)? as usize;
-        let shard_count = read_u32(&mut cursor)? as usize;
-        let mut shards = Vec::with_capacity(shard_count);
-        for _ in 0..shard_count {
-            let shard_id = read_u32(&mut cursor)?;
-            let next_offset = read_u64(&mut cursor)?;
-            let entry_count = read_u64(&mut cursor)? as usize;
-            let mut entries = Vec::with_capacity(entry_count);
-            for _ in 0..entry_count {
-                entries.push(read_entry(&mut cursor)?);
-            }
-            shards.push(RestoredShard {
-                shard_id,
-                next_offset,
-                entries,
-            });
-        }
-
-        let kafka_offsets = read_kafka_offsets(&mut cursor)?;
-        Ok((total_capacity, shards, kafka_offsets))
+        Ok((shards, kafka_offsets))
     }
+}
+
+fn load_sharded_v1(cursor: &mut &[u8]) -> io::Result<(Vec<RestoredShard>, KafkaOffsets)> {
+    let total_capacity = read_u64(cursor)? as usize;
+    let shard_count = read_u32(cursor)? as usize;
+    let capacities = split_total_capacity(total_capacity, shard_count);
+    let mut shards = Vec::with_capacity(shard_count);
+    for capacity in capacities {
+        let shard_id = read_u32(cursor)?;
+        let next_offset = read_u64(cursor)?;
+        let entry_count = read_u64(cursor)? as usize;
+        let mut entries = Vec::with_capacity(entry_count);
+        for _ in 0..entry_count {
+            entries.push(read_entry(cursor)?);
+        }
+        shards.push(RestoredShard {
+            shard_id,
+            capacity,
+            next_offset,
+            entries,
+        });
+    }
+
+    let kafka_offsets = read_kafka_offsets(cursor)?;
+    Ok((shards, kafka_offsets))
+}
+
+fn load_sharded_v2(cursor: &mut &[u8]) -> io::Result<(Vec<RestoredShard>, KafkaOffsets)> {
+    let shard_count = read_u32(cursor)? as usize;
+    let mut shards = Vec::with_capacity(shard_count);
+    for _ in 0..shard_count {
+        let shard_id = read_u32(cursor)?;
+        let capacity = read_u64(cursor)? as usize;
+        let next_offset = read_u64(cursor)?;
+        let entry_count = read_u64(cursor)? as usize;
+        let mut entries = Vec::with_capacity(entry_count);
+        for _ in 0..entry_count {
+            entries.push(read_entry(cursor)?);
+        }
+        shards.push(RestoredShard {
+            shard_id,
+            capacity,
+            next_offset,
+            entries,
+        });
+    }
+
+    let kafka_offsets = read_kafka_offsets(cursor)?;
+    Ok((shards, kafka_offsets))
 }
 
 // --- Binary encoding helpers ---
@@ -219,6 +255,14 @@ fn sync_parent_dir(path: &Path) -> io::Result<()> {
     File::open(parent)?.sync_all()
 }
 
+fn split_total_capacity(total_capacity: usize, shard_count: usize) -> Vec<usize> {
+    let base = total_capacity / shard_count;
+    let remainder = total_capacity % shard_count;
+    (0..shard_count)
+        .map(|idx| base + usize::from(idx < remainder))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,6 +285,7 @@ mod tests {
         let shards = vec![
             SnapshotShard {
                 shard_id: 0,
+                capacity: 250,
                 next_offset: 3,
                 entries: vec![
                     make_entry(100, "auth", "h0"),
@@ -250,6 +295,7 @@ mod tests {
             },
             SnapshotShard {
                 shard_id: 1,
+                capacity: 250,
                 next_offset: 2,
                 entries: vec![
                     make_entry(150, "auth", "h1"),
@@ -262,17 +308,18 @@ mod tests {
         offsets.set("logs", 0, 45230);
         offsets.set("logs", 1, 38901);
 
-        Snapshot::save_sharded(&path, 500, &shards, &offsets).unwrap();
+        Snapshot::save_sharded(&path, &shards, &offsets).unwrap();
 
-        let (capacity, restored, offsets_loaded) = Snapshot::load_sharded(&path).unwrap();
+        let (restored, offsets_loaded) = Snapshot::load_sharded(&path).unwrap();
 
-        assert_eq!(capacity, 500);
         assert_eq!(restored.len(), 2);
         assert_eq!(restored[0].shard_id, 0);
+        assert_eq!(restored[0].capacity, 250);
         assert_eq!(restored[0].entries.len(), 3);
         assert_eq!(restored[0].next_offset, 3);
         assert_eq!(restored[0].entries[0].timestamp, 100);
         assert_eq!(restored[1].shard_id, 1);
+        assert_eq!(restored[1].capacity, 250);
         assert_eq!(restored[1].entries.len(), 2);
         assert_eq!(restored[1].next_offset, 2);
         assert_eq!(restored[1].entries[0].service_name, "auth");
