@@ -1,12 +1,12 @@
 # ChironVision Log Buffer
 
-An in-memory, Kafka-backed log store for incident-style queries over recent observability data, plus a small Go benchmark used for side-by-side query-path comparisons.
+An in-memory, Kafka-backed log store for incident-style queries over recent observability data
 
 ## Assumptions
 
 1. **Timestamps are roughly monotonic.** Logs arrive mostly in order, with only small jitter.
 2. **Host-scoped queries are the primary query paths.** `ByHost` is the hottest path, `ByServiceAndHost` is the next most common narrowing query, and `ByService` is a broader fleet-wide query that can afford fanout.
-3. **Noisy hosts should mostly pay their own retention cost.** When one shard gets much hotter than the rest, it should preferentially shed its own older data instead of pushing out quieter shards.
+3. **Abnormally noisy hosts are expected to be handled upstream.** If a host starts emitting an unusual amount of data, we assume an external alerting or signal-management service will detect and manage that condition. Locally, retention still prefers to shed that shard's own older data instead of pushing out quieter shards.
 4. **Freshness on the live path matters.** Newly ingested records are indexed inline so accepted records are queryable immediately instead of waiting on a background flush tick.
 
 ## Architecture: Partition-Local Shards
@@ -183,9 +183,6 @@ src/
 ├── pipeline.rs          # Kafka pipeline (still includes a legacy indexer loop)
 ├── snapshot.rs          # Snapshot encoding/decoding
 └── chiron.rs            # Shard-aware ChironStore
-go_three_maps/
-├── go.mod               # Standalone Go module for the benchmark
-└── main.go              # In-memory Go benchmark with matching query semantics
 ```
 
 ## Usage
@@ -207,13 +204,6 @@ Kafka integration tests are ignored by default:
 cargo test --test e2e -- --ignored --nocapture
 ```
 
-Go benchmark:
-
-```bash
-cd go_three_maps
-go run .
-```
-
 Use the remaining ignored Kafka E2E tests for:
 
 - Kafka producer/consumer wiring
@@ -221,9 +211,7 @@ Use the remaining ignored Kafka E2E tests for:
 - snapshot/restore round-trips
 - long-run correctness across the real Kafka integration path
 
-Those tests are useful for integration coverage. If you want a separate
-store-only comparison point, the Go benchmark under `go_three_maps/` is still
-available.
+Those tests are useful for integration coverage.
 
 If no broker is reachable at `localhost:9092`, the E2E tests skip with a message instead of failing noisily.
 
