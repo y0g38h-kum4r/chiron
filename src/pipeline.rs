@@ -1,5 +1,5 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::{env, fmt::Display};
@@ -121,11 +121,11 @@ impl DummyService {
 /// 6. Flush indexer, return stats
 pub fn run_pipeline(
     config: PipelineConfig,
-) -> Result<(Arc<Mutex<ChironStore>>, PipelineStats), ChironKafkaError> {
-    let store = Arc::new(Mutex::new(ChironStore::with_shards(
+) -> Result<(Arc<ChironStore>, PipelineStats), ChironKafkaError> {
+    let store = Arc::new(ChironStore::with_shards(
         config.ring_buffer_capacity,
         config.num_partitions as usize,
-    )));
+    ));
     let producers_done = Arc::new(AtomicBool::new(false));
     let consumers_done = Arc::new(AtomicBool::new(false));
     let max_indexer_lag = Arc::new(AtomicU64::new(0));
@@ -158,14 +158,13 @@ pub fn run_pipeline(
 
         loop {
             {
-                let mut s = index_store.lock().unwrap();
-                s.flush_indexer();
+                index_store.flush_indexer();
                 flushes += 1;
-                update_max_atomic(&index_lag_metric, s.indexer_lag());
+                update_max_atomic(&index_lag_metric, index_store.indexer_lag());
             }
 
             if index_done.load(Ordering::SeqCst) {
-                let lag = index_store.lock().unwrap().indexer_lag();
+                let lag = index_store.indexer_lag();
                 update_max_atomic(&index_lag_metric, lag);
                 if lag == 0 {
                     break;
@@ -190,8 +189,9 @@ pub fn run_pipeline(
             let topic = config.topic.clone();
             let logs = config.logs_per_producer;
 
+            let num_partitions = config.num_partitions as usize;
             producer_threads.push(thread::spawn(move || {
-                let producer = ChironProducer::new(&brokers, &topic)?;
+                let producer = ChironProducer::new(&brokers, &topic, num_partitions)?;
                 let dummy = DummyService {
                     service_name: svc_name,
                     host_id,
@@ -252,7 +252,7 @@ fn consume_partition(
     brokers: &str,
     topic: &str,
     group: &str,
-    store: Arc<Mutex<ChironStore>>,
+    store: Arc<ChironStore>,
     producers_done: Arc<AtomicBool>,
 ) -> Result<(u64, KafkaOffsets), ChironKafkaError> {
     let consumer = ChironConsumer::new(brokers, topic, group)?;
@@ -285,12 +285,7 @@ fn consume_partition(
 
                 // Ingest batch into the partition-local shards first so a crash
                 // cannot acknowledge records that were never accepted locally.
-                {
-                    let mut s = store.lock().unwrap();
-                    for (entry, partition) in batch.drain(..) {
-                        s.ingest_partition(partition, entry);
-                    }
-                }
+                ingest_batch_by_partition(&store, &mut batch);
 
                 consumer.commit()?;
             }
@@ -333,4 +328,27 @@ fn join_thread_result<T>(
     handle
         .join()
         .map_err(|_| ChironKafkaError::ThreadPanic("worker thread panicked"))?
+}
+
+fn ingest_batch_by_partition(store: &ChironStore, batch: &mut Vec<(LogEntry, u32)>) {
+    if batch.is_empty() {
+        return;
+    }
+
+    batch.sort_unstable_by_key(|(_, partition)| *partition);
+
+    let mut current_partition = batch[0].1;
+    let mut partition_entries = Vec::new();
+
+    for (entry, partition) in batch.drain(..) {
+        if partition != current_partition && !partition_entries.is_empty() {
+            store.ingest_partition_batch(current_partition, std::mem::take(&mut partition_entries));
+            current_partition = partition;
+        }
+        partition_entries.push(entry);
+    }
+
+    if !partition_entries.is_empty() {
+        store.ingest_partition_batch(current_partition, partition_entries);
+    }
 }

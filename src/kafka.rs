@@ -8,6 +8,7 @@ use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
 use rdkafka::topic_partition_list::Offset;
 
 use crate::log_entry::LogEntry;
+use crate::partition_for_host;
 
 #[derive(Debug)]
 pub enum ChironKafkaError {
@@ -41,14 +42,16 @@ impl From<KafkaError> for ChironKafkaError {
 }
 
 /// Kafka producer that sends LogEntry records as JSON to a topic.
-/// Partitions by host_id (key).
+/// Uses deterministic `hash(host_id) % num_partitions` to pick the partition,
+/// guaranteeing alignment with `ChironStore` shard routing.
 pub struct ChironProducer {
     producer: BaseProducer,
     topic: String,
+    num_partitions: usize,
 }
 
 impl ChironProducer {
-    pub fn new(brokers: &str, topic: &str) -> Result<Self, ChironKafkaError> {
+    pub fn new(brokers: &str, topic: &str, num_partitions: usize) -> Result<Self, ChironKafkaError> {
         let producer: BaseProducer = ClientConfig::new()
             .set("bootstrap.servers", brokers)
             .set("message.timeout.ms", "5000")
@@ -58,17 +61,20 @@ impl ChironProducer {
         Ok(Self {
             producer,
             topic: topic.to_string(),
+            num_partitions,
         })
     }
 
-    /// Send a log entry. The host_id is used as the partition key
-    /// so all logs from the same host land on the same partition (ordering guarantee).
+    /// Send a log entry. The partition is computed deterministically from
+    /// `host_id` so all logs from the same host land on the same partition/shard.
     pub fn send(&self, entry: &LogEntry) -> Result<(), ChironKafkaError> {
         let payload = serde_json::to_string(entry).map_err(ChironKafkaError::Serialize)?;
+        let partition = partition_for_host(&entry.host_id, self.num_partitions) as i32;
 
         self.producer
             .send(
                 BaseRecord::to(&self.topic)
+                    .partition(partition)
                     .key(&entry.host_id)
                     .payload(&payload),
             )

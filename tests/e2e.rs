@@ -74,18 +74,17 @@ fn produce_and_consume(
     entries: &[LogEntry],
     store_capacity: usize,
 ) -> Result<(ChironStore, u64), Box<dyn std::error::Error>> {
-    // --- Produce ---
-    let producer = ChironProducer::new(BROKERS, topic)?;
+    // --- Produce (single shard, so num_partitions=1) ---
+    let producer = ChironProducer::new(BROKERS, topic, 1)?;
     for e in entries {
         producer.send(e)?;
     }
     producer.flush(Duration::from_secs(10))?;
-    // Drop the producer — all messages are flushed.
     drop(producer);
 
     // --- Consume ---
     let consumer = ChironConsumer::new(BROKERS, topic, group)?;
-    let mut store = ChironStore::new(store_capacity);
+    let store = ChironStore::new(store_capacity);
     let mut consumed = 0u64;
 
     let poll_timeout = Duration::from_millis(500);
@@ -121,7 +120,7 @@ fn produce_and_consume_sharded(
     store_capacity: usize,
     shard_count: usize,
 ) -> Result<(ChironStore, u64), Box<dyn std::error::Error>> {
-    let producer = ChironProducer::new(BROKERS, topic)?;
+    let producer = ChironProducer::new(BROKERS, topic, shard_count)?;
     for e in entries {
         producer.send(e)?;
     }
@@ -129,7 +128,7 @@ fn produce_and_consume_sharded(
     drop(producer);
 
     let consumer = ChironConsumer::new(BROKERS, topic, group)?;
-    let mut store = ChironStore::with_shards(store_capacity, shard_count);
+    let store = ChironStore::with_shards(store_capacity, shard_count);
     let mut consumed = 0u64;
 
     let poll_timeout = Duration::from_millis(500);
@@ -477,7 +476,7 @@ fn kafka_concurrent_producers() {
     for t in 0..num_threads {
         let topic_clone = topic.clone();
         handles.push(thread::spawn(move || {
-            let producer = ChironProducer::new(BROKERS, &topic_clone).unwrap();
+            let producer = ChironProducer::new(BROKERS, &topic_clone, 4).unwrap();
             let svc = format!("svc-{}", t % 2);
             let host = format!("host-{}", t % 2);
             for i in 0..entries_per_thread {
@@ -607,7 +606,7 @@ fn kafka_consumer_offset_tracking() {
     // Produce 20 entries.
     let entries: Vec<LogEntry> = (0..20).map(|i| entry(i, "svc", "h0")).collect();
 
-    let producer = ChironProducer::new(BROKERS, &topic).unwrap();
+    let producer = ChironProducer::new(BROKERS, &topic, 1).unwrap();
     for e in &entries {
         producer.send(e).unwrap();
     }

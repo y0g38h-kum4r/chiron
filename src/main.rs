@@ -84,17 +84,16 @@ fn main() {
 
     // --- Query the store ---
     {
-        let s = store.lock().unwrap();
         println!(
             "Buffer: {}/{} entries, indexer lag: {}\n",
-            s.len(),
-            s.capacity(),
-            s.indexer_lag()
+            store.len(),
+            store.capacity(),
+            store.indexer_lag()
         );
 
         // Query (a): by service
         println!("--- Query (a): AuthService logs ---");
-        let result = s.query_by_service("AuthService", 0, i64::MAX);
+        let result = store.query_by_service("AuthService", 0, i64::MAX);
         println!("  Found {} entries", result.entries.len());
         for entry in result.entries.iter().take(3) {
             println!(
@@ -108,7 +107,7 @@ fn main() {
 
         // Query (b): by host
         println!("\n--- Query (b): host-2 logs ---");
-        let result = s.query_by_host("host-2", 0, i64::MAX);
+        let result = store.query_by_host("host-2", 0, i64::MAX);
         println!("  Found {} entries", result.entries.len());
         for entry in result.entries.iter().take(3) {
             println!(
@@ -122,7 +121,7 @@ fn main() {
 
         // Query (c): by service + host
         println!("\n--- Query (c): AuthService on host-0 ---");
-        let result = s.query_by_service_and_host("AuthService", "host-0", 0, i64::MAX);
+        let result = store.query_by_service_and_host("AuthService", "host-0", 0, i64::MAX);
         println!("  Found {} entries", result.entries.len());
         for entry in result.entries.iter().take(3) {
             println!(
@@ -138,10 +137,9 @@ fn main() {
     // --- Snapshot with kafka offsets ---
     let snap_path = Path::new("/tmp/chiron_pipeline.snap");
     println!("\n--- Snapshot ---");
-    {
-        let s = store.lock().unwrap();
-        s.save_snapshot(snap_path, &stats.kafka_offsets).unwrap();
-    }
+    store
+        .save_snapshot(snap_path, &stats.kafka_offsets)
+        .unwrap();
     println!("  Saved to {:?}", snap_path);
 
     // Restore and verify

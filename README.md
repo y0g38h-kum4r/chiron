@@ -197,10 +197,6 @@ cargo test
 
 Store-only Rust benchmark:
 
-```bash
-cargo run --release --bin bench
-```
-
 Kafka integration tests are ignored by default:
 
 ```bash
@@ -214,26 +210,6 @@ cd go_three_maps
 go run .
 ```
 
-The Rust `bench` binary and the Go benchmark now use the same **store-only**
-workload:
-
-- build the full 1,000,000-row dataset eagerly in memory
-- build any queryable indexes required by that implementation
-- run the same 10,000-query verified mix
-- optionally repeat the query pass via `CHIRON_BENCH_QUERY_REPEATS`
-- use the shared-string query path for result materialization instead of forcing deep string copies on every hit
-
-Both benchmarks print the same high-level fields so their results are easier to
-compare side by side.
-
-The query mix in this benchmark is intentionally host-heavy:
-
-- 60% `ByHost`
-- 30% `ByServiceAndHost`
-- 10% `ByService`
-
-Use the store-only benchmark for query-path and data-structure performance work.
-
 Use the remaining ignored Kafka E2E tests for:
 
 - Kafka producer/consumer wiring
@@ -241,8 +217,9 @@ Use the remaining ignored Kafka E2E tests for:
 - snapshot/restore round-trips
 - long-run correctness across the real Kafka integration path
 
-Those tests are useful for integration coverage, but the store-only benchmark is
-the right tool for judging small store-level optimizations.
+Those tests are useful for integration coverage. If you want a separate
+store-only comparison point, the Go benchmark under `go_three_maps/` is still
+available.
 
 If no broker is reachable at `localhost:9092`, the E2E tests skip with a message instead of failing noisily.
 

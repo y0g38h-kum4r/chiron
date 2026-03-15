@@ -1,8 +1,10 @@
-use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, VecDeque};
-use std::hash::{Hash, Hasher};
+use std::collections::VecDeque;
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+
+use crate::partition_for_host;
 
 use crate::inverted_index::InvertedIndex;
 use crate::log_entry::{LogEntry, SharedLogEntry};
@@ -16,15 +18,20 @@ use crate::snapshot::{KafkaOffsets, RestoredShard, Snapshot, SnapshotShard};
 /// shard causes capacity pressure it preferentially sheds its own oldest data
 /// before displacing quieter shards.
 pub struct ChironStore {
-    shards: Vec<PartitionShard>,
-    host_routes: HashMap<String, u32>,
+    shards: RwLock<Vec<Arc<PartitionShard>>>,
     total_capacity: usize,
-    live_len: usize,
+    live_len: AtomicUsize,
+    shard_admin: Mutex<()>,
+    capacity_admin: Mutex<()>,
 }
 
 struct PartitionShard {
     shard_id: u32,
     capacity: usize,
+    inner: RwLock<PartitionShardState>,
+}
+
+struct PartitionShardState {
     buffer: PartitionBuffer,
     indexer_pos: u64,
     service_index: InvertedIndex,
@@ -40,7 +47,6 @@ struct PartitionBuffer {
 pub struct QueryResult {
     pub entries: Vec<LogEntry>,
 }
-
 
 impl PartitionBuffer {
     fn new() -> Self {
@@ -108,29 +114,7 @@ impl PartitionBuffer {
     }
 }
 
-impl PartitionShard {
-    fn new(shard_id: u32, capacity: usize) -> Self {
-        Self {
-            shard_id,
-            capacity,
-            buffer: PartitionBuffer::new(),
-            indexer_pos: 0,
-            service_index: InvertedIndex::new(),
-            host_index: InvertedIndex::new(),
-        }
-    }
-
-    fn from_restored(restored: RestoredShard) -> io::Result<Self> {
-        Ok(Self {
-            shard_id: restored.shard_id,
-            capacity: restored.capacity,
-            buffer: PartitionBuffer::from_snapshot(restored.next_offset, restored.entries)?,
-            indexer_pos: 0,
-            service_index: InvertedIndex::new(),
-            host_index: InvertedIndex::new(),
-        })
-    }
-
+impl PartitionShardState {
     fn ingest(&mut self, entry: SharedLogEntry) -> u64 {
         self.buffer.push(entry)
     }
@@ -240,10 +224,6 @@ impl PartitionShard {
         self.buffer.len()
     }
 
-    fn capacity(&self) -> usize {
-        self.capacity
-    }
-
     fn evict_head(&mut self, count: usize) -> usize {
         let evicted = self.buffer.evict_head(count);
         if evicted == 0 {
@@ -257,6 +237,98 @@ impl PartitionShard {
     }
 }
 
+impl PartitionShard {
+    fn new(shard_id: u32, capacity: usize) -> Self {
+        Self {
+            shard_id,
+            capacity,
+            inner: RwLock::new(PartitionShardState {
+                buffer: PartitionBuffer::new(),
+                indexer_pos: 0,
+                service_index: InvertedIndex::new(),
+                host_index: InvertedIndex::new(),
+            }),
+        }
+    }
+
+    fn from_restored(restored: RestoredShard) -> io::Result<Self> {
+        Ok(Self {
+            shard_id: restored.shard_id,
+            capacity: restored.capacity,
+            inner: RwLock::new(PartitionShardState {
+                buffer: PartitionBuffer::from_snapshot(restored.next_offset, restored.entries)?,
+                indexer_pos: 0,
+                service_index: InvertedIndex::new(),
+                host_index: InvertedIndex::new(),
+            }),
+        })
+    }
+
+    fn ingest(&self, entry: SharedLogEntry) -> u64 {
+        self.inner.write().unwrap().ingest(entry)
+    }
+
+    fn ingest_batch(&self, entries: Vec<SharedLogEntry>) -> usize {
+        let len = entries.len();
+        if len == 0 {
+            return 0;
+        }
+
+        let mut inner = self.inner.write().unwrap();
+        for entry in entries {
+            inner.ingest(entry);
+        }
+
+        len
+    }
+
+    fn flush_indexer(&self) {
+        self.inner.write().unwrap().flush_indexer();
+    }
+
+    fn indexer_lag(&self) -> u64 {
+        self.inner.read().unwrap().indexer_lag()
+    }
+
+    fn query_by_service(&self, service: &str, t1: i64, t2: i64) -> Vec<LogEntry> {
+        self.inner.read().unwrap().query_by_service(service, t1, t2)
+    }
+
+    fn query_by_host(&self, host: &str, t1: i64, t2: i64) -> Vec<LogEntry> {
+        self.inner.read().unwrap().query_by_host(host, t1, t2)
+    }
+
+    fn query_by_service_and_host(
+        &self,
+        service: &str,
+        host: &str,
+        t1: i64,
+        t2: i64,
+    ) -> Vec<LogEntry> {
+        self.inner
+            .read()
+            .unwrap()
+            .query_by_service_and_host(service, host, t1, t2)
+    }
+
+    fn len(&self) -> usize {
+        self.inner.read().unwrap().len()
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn evict_head(&self, count: usize) -> usize {
+        self.inner.write().unwrap().evict_head(count)
+    }
+
+    fn entries_owned(&self) -> Vec<LogEntry> {
+        self.inner.read().unwrap().buffer.entries_owned()
+    }
+
+}
+
 impl ChironStore {
     pub fn new(capacity: usize) -> Self {
         Self::with_shards(capacity, 1)
@@ -268,62 +340,75 @@ impl ChironStore {
 
         let shards = (0..shard_count)
             .map(|shard_id| {
-                PartitionShard::new(
+                Arc::new(PartitionShard::new(
                     shard_id as u32,
                     shard_capacity_for_position(total_capacity, shard_count, shard_id),
-                )
+                ))
             })
             .collect();
 
         Self {
-            shards,
-            host_routes: HashMap::new(),
+            shards: RwLock::new(shards),
             total_capacity,
-            live_len: 0,
+            live_len: AtomicUsize::new(0),
+            shard_admin: Mutex::new(()),
+            capacity_admin: Mutex::new(()),
         }
     }
 
     /// Append using the store's host-based sharding strategy.
-    pub fn ingest(&mut self, entry: LogEntry) -> u64 {
-        let shard_id = self.route_host_to_shard(&entry.host_id);
-        let shard_route = self.shards[shard_id].shard_id;
-        self.register_host_route(&entry.host_id, shard_route);
-        self.evict_while_full_for_shard(shard_id);
-        let offset = self.shards[shard_id].ingest(entry.into());
-        self.live_len += 1;
-        offset
+    pub fn ingest(&self, entry: LogEntry) -> u64 {
+        let shard = self.shard_for_host(&entry.host_id);
+        self.reserve_slot_for_shard(&shard);
+        shard.ingest(entry.into())
     }
 
     /// Append directly into the shard that corresponds to a Kafka partition.
-    pub fn ingest_partition(&mut self, partition_id: u32, entry: LogEntry) -> u64 {
-        let position = self.ensure_shard(partition_id);
-        let shard_route = self.shards[position].shard_id;
-        self.register_host_route(&entry.host_id, shard_route);
-        self.evict_while_full_for_shard(position);
-        let offset = self.shards[position].ingest(entry.into());
-        self.live_len += 1;
-        offset
+    pub fn ingest_partition(&self, partition_id: u32, entry: LogEntry) -> u64 {
+        let shard = self.ensure_shard(partition_id);
+        self.reserve_slot_for_shard(&shard);
+        shard.ingest(entry.into())
     }
 
-    pub fn flush_indexer(&mut self) {
-        for shard in &mut self.shards {
+    /// Append a batch directly into the shard that corresponds to a Kafka partition.
+    pub fn ingest_partition_batch(&self, partition_id: u32, entries: Vec<LogEntry>) -> usize {
+        if entries.is_empty() {
+            return 0;
+        }
+
+        let shard = self.ensure_shard(partition_id);
+        let mut shared_entries = Vec::with_capacity(entries.len());
+
+        for entry in entries {
+            self.reserve_slot_for_shard(&shard);
+            shared_entries.push(entry.into());
+        }
+
+        shard.ingest_batch(shared_entries)
+    }
+
+    pub fn flush_indexer(&self) {
+        for shard in self.shard_handles() {
             shard.flush_indexer();
         }
     }
 
-    pub fn flush_indexer_shard(&mut self, shard_id: u32) {
-        if let Some(position) = self.shard_position(shard_id) {
-            self.shards[position].flush_indexer();
+    pub fn flush_indexer_shard(&self, shard_id: u32) {
+        if let Some(shard) = self.shard_by_id(shard_id) {
+            shard.flush_indexer();
         }
     }
 
     pub fn indexer_lag(&self) -> u64 {
-        self.shards.iter().map(PartitionShard::indexer_lag).sum()
+        self.shard_handles()
+            .iter()
+            .map(|shard| shard.indexer_lag())
+            .sum()
     }
 
     pub fn query_by_service(&self, service: &str, t1: i64, t2: i64) -> QueryResult {
         let mut entries = Vec::new();
-        for shard in &self.shards {
+        for shard in self.shard_handles() {
             entries.extend(shard.query_by_service(service, t1, t2));
         }
         sort_entries(&mut entries);
@@ -331,14 +416,8 @@ impl ChironStore {
     }
 
     pub fn query_by_host(&self, host: &str, t1: i64, t2: i64) -> QueryResult {
-        let mut entries = Vec::new();
-        if let Some(shard_idx) = self.shard_position_for_host(host) {
-            entries.extend(self.shards[shard_idx].query_by_host(host, t1, t2));
-        } else {
-            for shard in &self.shards {
-                entries.extend(shard.query_by_host(host, t1, t2));
-            }
-        }
+        let shard = self.shard_for_host(host);
+        let mut entries = shard.query_by_host(host, t1, t2);
         sort_entries(&mut entries);
         QueryResult { entries }
     }
@@ -350,20 +429,14 @@ impl ChironStore {
         t1: i64,
         t2: i64,
     ) -> QueryResult {
-        let mut entries = Vec::new();
-        if let Some(shard_idx) = self.shard_position_for_host(host) {
-            entries.extend(self.shards[shard_idx].query_by_service_and_host(service, host, t1, t2));
-        } else {
-            for shard in &self.shards {
-                entries.extend(shard.query_by_service_and_host(service, host, t1, t2));
-            }
-        }
+        let shard = self.shard_for_host(host);
+        let mut entries = shard.query_by_service_and_host(service, host, t1, t2);
         sort_entries(&mut entries);
         QueryResult { entries }
     }
 
     pub fn len(&self) -> usize {
-        self.live_len
+        self.live_len.load(Ordering::Acquire)
     }
 
     pub fn capacity(&self) -> usize {
@@ -371,18 +444,18 @@ impl ChironStore {
     }
 
     pub fn shard_count(&self) -> usize {
-        self.shards.len()
+        self.shards.read().unwrap().len()
     }
 
     pub fn save_snapshot(&self, path: &Path, kafka_offsets: &KafkaOffsets) -> io::Result<()> {
         let shards: Vec<_> = self
-            .shards
+            .shard_handles()
             .iter()
             .map(|shard| SnapshotShard {
                 shard_id: shard.shard_id,
                 capacity: shard.capacity(),
-                next_offset: shard.buffer.next_offset(),
-                entries: shard.buffer.entries_owned(),
+                next_offset: shard.inner.read().unwrap().buffer.next_offset(),
+                entries: shard.entries_owned(),
             })
             .collect();
 
@@ -400,28 +473,50 @@ impl ChironStore {
 
         let mut shards = Vec::with_capacity(restored_shards.len());
         for restored in restored_shards {
-            shards.push(PartitionShard::from_restored(restored)?);
+            shards.push(Arc::new(PartitionShard::from_restored(restored)?));
         }
         shards.sort_by_key(|shard| shard.shard_id);
 
-        let live_len = shards.iter().map(PartitionShard::len).sum();
-        let total_capacity = shards.iter().map(PartitionShard::capacity).sum();
-        let mut store = Self {
-            shards,
-            host_routes: HashMap::new(),
+        let live_len = shards.iter().map(|shard| shard.len()).sum();
+        let total_capacity = shards.iter().map(|shard| shard.capacity()).sum();
+        let store = Self {
+            shards: RwLock::new(shards),
             total_capacity,
-            live_len,
+            live_len: AtomicUsize::new(live_len),
+            shard_admin: Mutex::new(()),
+            capacity_admin: Mutex::new(()),
         };
-        store.rebuild_host_routes();
         store.flush_indexer();
 
         Ok((store, kafka_offsets))
     }
 
-    fn evict_while_full_for_shard(&mut self, shard_idx: usize) {
-        while self.len() >= self.capacity() {
-            let evicted = if self.shards[shard_idx].len() > 0 {
-                self.evict_from_shard(shard_idx, 1)
+    fn reserve_slot_for_shard(&self, target_shard: &Arc<PartitionShard>) {
+        loop {
+            let current = self.live_len.load(Ordering::Acquire);
+            if current < self.total_capacity {
+                if self
+                    .live_len
+                    .compare_exchange_weak(
+                        current,
+                        current + 1,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return;
+                }
+                continue;
+            }
+
+            let _guard = self.capacity_admin.lock().unwrap();
+            if self.live_len.load(Ordering::Acquire) < self.total_capacity {
+                continue;
+            }
+
+            let evicted = if target_shard.len() > 0 {
+                target_shard.evict_head(1)
             } else {
                 // If the target shard is empty, fall back to trimming the
                 // fullest shard so the new write can still be admitted.
@@ -429,107 +524,80 @@ impl ChironStore {
             };
 
             if evicted == 0 {
-                break;
+                self.live_len
+                    .store(self.live_len_from_shards(), Ordering::Release);
+                continue;
             }
+
+            self.live_len.fetch_sub(evicted, Ordering::AcqRel);
         }
     }
 
-    fn evict_fullest_shard(&mut self, count: usize) -> usize {
-        let Some((shard_idx, _)) = self
-            .shards
+    fn evict_fullest_shard(&self, count: usize) -> usize {
+        let Some(shard) = self
+            .shard_handles()
             .iter()
-            .enumerate()
-            .map(|(idx, shard)| (idx, shard.len()))
-            .filter(|(_, len)| *len > 0)
-            .max_by_key(|(_, len)| *len)
+            .filter(|shard| shard.len() > 0)
+            .max_by_key(|shard| shard.len())
+            .cloned()
         else {
             return 0;
         };
 
-        self.evict_from_shard(shard_idx, count)
+        shard.evict_head(count)
     }
 
-    fn evict_from_shard(&mut self, shard_idx: usize, count: usize) -> usize {
-        let evicted = self.shards[shard_idx].evict_head(count);
-        self.live_len = self.live_len.saturating_sub(evicted);
-        evicted
+    /// Deterministic host→shard routing. Uses the shared `partition_for_host`
+    /// function so producers and the store always agree on shard placement.
+    fn shard_for_host(&self, host: &str) -> Arc<PartitionShard> {
+        let pos = partition_for_host(host, self.shard_count());
+        self.shards.read().unwrap()[pos].clone()
     }
 
-    fn route_host_to_shard(&self, host: &str) -> usize {
-        if self.shards.len() == 1 {
-            return 0;
-        }
-
-        let mut hasher = DefaultHasher::new();
-        host.hash(&mut hasher);
-        (hasher.finish() as usize) % self.shards.len()
+    fn shard_handles(&self) -> Vec<Arc<PartitionShard>> {
+        self.shards.read().unwrap().iter().cloned().collect()
     }
 
-    fn shard_position_for_host(&self, host: &str) -> Option<usize> {
-        if let Some(shard_id) = self.host_routes.get(host) {
-            if let Some(position) = self.shard_position(*shard_id) {
-                return Some(position);
-            }
-        }
-
-        None
-    }
-
-    fn shard_position(&self, shard_id: u32) -> Option<usize> {
+    fn shard_by_id(&self, shard_id: u32) -> Option<Arc<PartitionShard>> {
         self.shards
+            .read()
+            .unwrap()
             .iter()
-            .position(|shard| shard.shard_id == shard_id)
+            .find(|shard| shard.shard_id == shard_id)
+            .cloned()
     }
 
-    fn ensure_shard(&mut self, shard_id: u32) -> usize {
-        if let Some(position) = self.shard_position(shard_id) {
-            return position;
+    fn ensure_shard(&self, shard_id: u32) -> Arc<PartitionShard> {
+        if let Some(shard) = self.shard_by_id(shard_id) {
+            return shard;
         }
 
-        let start = self.shards.len() as u32;
+        let _guard = self.shard_admin.lock().unwrap();
+        if let Some(shard) = self.shard_by_id(shard_id) {
+            return shard;
+        }
+
+        let mut shards = self.shards.write().unwrap();
+        let start = shards.len() as u32;
         for id in start..=shard_id {
-            // Dynamically added shards do not change the existing global budget.
-            self.shards.push(PartitionShard::new(id, 0));
+            shards.push(Arc::new(PartitionShard::new(id, 0)));
         }
 
-        self.shards.len() - 1
+        shards
+            .iter()
+            .find(|shard| shard.shard_id == shard_id)
+            .cloned()
+            .expect("newly created shard must exist")
     }
 
-    fn register_host_route(&mut self, host: &str, shard_id: u32) {
-        match self.host_routes.get(host) {
-            Some(existing_shard_id) if *existing_shard_id != shard_id => {
-                panic!(
-                    "host {} was indexed into multiple shards: {} and {}",
-                    host, existing_shard_id, shard_id
-                );
-            }
-            Some(_) => {}
-            None => {
-                self.host_routes.insert(host.to_string(), shard_id);
-            }
-        }
-    }
-
-    fn rebuild_host_routes(&mut self) {
-        self.host_routes.clear();
-        let mut routes = Vec::new();
-
-        for shard in &self.shards {
-            for entry in &shard.buffer.entries {
-                routes.push((entry.host_id.clone(), shard.shard_id));
-            }
-        }
-
-        for (host, shard_id) in routes {
-            self.register_host_route(&host, shard_id);
-        }
+    fn live_len_from_shards(&self) -> usize {
+        self.shard_handles().iter().map(|shard| shard.len()).sum()
     }
 }
 
 fn sort_entries(entries: &mut [LogEntry]) {
     entries.sort_unstable_by_key(|entry| entry.timestamp);
 }
-
 
 fn shard_capacity_for_position(
     total_capacity: usize,
@@ -565,7 +633,7 @@ mod tests {
 
     #[test]
     fn ingest_flush_and_query() {
-        let mut store = ChironStore::new(1000);
+        let store = ChironStore::new(1000);
 
         store.ingest(make_entry(10, "auth", "h1"));
         store.ingest(make_entry(20, "payment", "h1"));
@@ -584,7 +652,7 @@ mod tests {
 
     #[test]
     fn query_by_host() {
-        let mut store = ChironStore::new(1000);
+        let store = ChironStore::new(1000);
         store.ingest(make_entry(10, "auth", "h1"));
         store.ingest(make_entry(20, "auth", "h2"));
         store.ingest(make_entry(30, "payment", "h1"));
@@ -598,7 +666,7 @@ mod tests {
 
     #[test]
     fn query_by_service_and_host() {
-        let mut store = ChironStore::new(1000);
+        let store = ChironStore::new(1000);
         store.ingest(make_entry(10, "auth", "h1"));
         store.ingest(make_entry(20, "auth", "h2"));
         store.ingest(make_entry(30, "payment", "h1"));
@@ -609,25 +677,60 @@ mod tests {
         assert_eq!(result.entries[0].timestamp, 10);
     }
 
+    /// Helper: compute the correct partition for a host given a shard count,
+    /// using the same deterministic hash the store uses.
+    fn part(host: &str, shard_count: usize) -> u32 {
+        partition_for_host(host, shard_count) as u32
+    }
+
     #[test]
     fn shard_local_flush_only_indexes_that_shard() {
-        let mut store = ChironStore::with_shards(12, 2);
-        store.ingest_partition(0, make_entry(10, "auth", "h0"));
-        store.ingest_partition(1, make_entry(20, "auth", "h1"));
+        let store = ChironStore::with_shards(12, 2);
+        let p0 = part("host-0", 2);
+        let p1 = part("host-1", 2);
+        assert_ne!(p0, p1, "pick hosts that hash to different shards");
 
-        store.flush_indexer_shard(1);
+        store.ingest_partition(p0, make_entry(10, "auth", "host-0"));
+        store.ingest_partition(p1, make_entry(20, "auth", "host-1"));
 
-        let h0 = store.query_by_host("h0", 0, 100);
+        store.flush_indexer_shard(p1);
+
+        let h0 = store.query_by_host("host-0", 0, 100);
         assert!(h0.entries.is_empty());
 
-        let h1 = store.query_by_host("h1", 0, 100);
+        let h1 = store.query_by_host("host-1", 0, 100);
         assert_eq!(h1.entries.len(), 1);
         assert_eq!(h1.entries[0].timestamp, 20);
     }
 
     #[test]
+    fn batch_ingest_partition_indexes_all_entries() {
+        let store = ChironStore::with_shards(12, 2);
+        let p = part("h1", 2);
+        let ingested = store.ingest_partition_batch(
+            p,
+            vec![
+                make_entry(10, "auth", "h1"),
+                make_entry(20, "auth", "h1"),
+            ],
+        );
+        assert_eq!(ingested, 2);
+        assert_eq!(store.len(), 2);
+
+        store.flush_indexer_shard(p);
+
+        let host = store.query_by_host("h1", 0, 100);
+        assert_eq!(host.entries.len(), 2);
+        assert_nondecreasing_timestamps(&host.entries);
+
+        let pair = store.query_by_service_and_host("auth", "h1", 0, 100);
+        assert_eq!(pair.entries.len(), 2);
+        assert_nondecreasing_timestamps(&pair.entries);
+    }
+
+    #[test]
     fn query_respects_time_range() {
-        let mut store = ChironStore::new(1000);
+        let store = ChironStore::new(1000);
         for ts in [5, 10, 15, 20, 25] {
             store.ingest(make_entry(ts, "svc", "h1"));
         }
@@ -640,12 +743,12 @@ mod tests {
 
     #[test]
     fn indexer_lag_tracks_unindexed() {
-        let mut store = ChironStore::new(1000);
+        let store = ChironStore::new(1000);
         assert_eq!(store.indexer_lag(), 0);
         assert_eq!(store.len(), 0);
 
         store.ingest(make_entry(1, "a", "h1"));
-        store.ingest(make_entry(2, "b", "h2"));
+        store.ingest(make_entry(2, "b", "h1"));
         assert_eq!(store.indexer_lag(), 2);
         assert_eq!(store.len(), 2);
 
@@ -655,7 +758,7 @@ mod tests {
 
     #[test]
     fn flush_indexer_makes_entries_queryable() {
-        let mut store = ChironStore::new(1000);
+        let store = ChironStore::new(1000);
         for ts in 0..100 {
             store.ingest(make_entry(ts, "svc", "h1"));
         }
@@ -669,21 +772,19 @@ mod tests {
 
     #[test]
     fn sharded_queries_route_by_host() {
-        let mut store = ChironStore::with_shards(12, 4);
-        store.ingest_partition(0, make_entry(10, "auth", "h0"));
-        store.ingest_partition(1, make_entry(20, "auth", "h1"));
-        store.ingest_partition(2, make_entry(30, "payments", "h2"));
-        store.ingest_partition(1, make_entry(40, "auth", "h1"));
+        let shard_count = 4;
+        let store = ChironStore::with_shards(100, shard_count);
+
+        // Use ingest() which routes via partition_for_host automatically.
+        store.ingest(make_entry(10, "auth", "h0"));
+        store.ingest(make_entry(20, "auth", "h1"));
+        store.ingest(make_entry(30, "payments", "h2"));
+        store.ingest(make_entry(40, "auth", "h1"));
         store.flush_indexer();
 
         let host_result = store.query_by_host("h1", 0, 100);
         assert_eq!(host_result.entries.len(), 2);
-        assert!(
-            host_result
-                .entries
-                .iter()
-                .all(|entry| entry.host_id == "h1")
-        );
+        assert!(host_result.entries.iter().all(|e| e.host_id == "h1"));
 
         let service_result = store.query_by_service("auth", 0, 100);
         assert_eq!(service_result.entries.len(), 3);
@@ -695,43 +796,40 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "was indexed into multiple shards")]
-    fn indexing_panics_when_host_appears_in_multiple_shards() {
-        let mut store = ChironStore::with_shards(12, 4);
-        store.ingest_partition(0, make_entry(10, "auth", "h1"));
-        store.ingest_partition(1, make_entry(20, "auth", "h1"));
-    }
-
-    #[test]
     fn sharded_eviction_prefers_the_writing_shard() {
-        let mut store = ChironStore::with_shards(4, 2);
-        store.ingest_partition(0, make_entry(30, "svc", "h0"));
-        store.ingest_partition(1, make_entry(10, "svc", "h1"));
-        store.ingest_partition(0, make_entry(40, "svc", "h0"));
-        store.ingest_partition(1, make_entry(20, "svc", "h1"));
+        let store = ChironStore::with_shards(4, 2);
+        let p0 = part("h0", 2);
+        let p1 = part("h1", 2);
+        assert_ne!(p0, p1, "pick hosts that hash to different shards");
+
+        store.ingest_partition(p0, make_entry(30, "svc", "h0"));
+        store.ingest_partition(p1, make_entry(10, "svc", "h1"));
+        store.ingest_partition(p0, make_entry(40, "svc", "h0"));
+        store.ingest_partition(p1, make_entry(20, "svc", "h1"));
         assert_eq!(store.len(), 4);
-        store.ingest_partition(0, make_entry(50, "svc", "h0"));
+        store.ingest_partition(p0, make_entry(50, "svc", "h0"));
         assert_eq!(store.len(), 4);
         store.flush_indexer();
 
         let result = store.query_by_service("svc", 0, 100);
         assert_eq!(result.entries.len(), 4);
-        let timestamps: Vec<_> = result.entries.iter().map(|entry| entry.timestamp).collect();
+        let timestamps: Vec<_> = result.entries.iter().map(|e| e.timestamp).collect();
         assert_eq!(timestamps, vec![10, 20, 40, 50]);
         assert_nondecreasing_timestamps(&result.entries);
     }
 
     #[test]
     fn hot_shard_evicts_own_entries_under_pressure() {
-        let mut store = ChironStore::with_shards(12, 4);
-        // Fill all 12 slots into shard 0.
+        let store = ChironStore::with_shards(12, 4);
+        let p = part("hot-host", 4);
+        // Fill all 12 slots into one shard.
         for ts in 0..12 {
-            store.ingest_partition(0, make_entry(ts, "svc", "hot-host"));
+            store.ingest_partition(p, make_entry(ts, "svc", "hot-host"));
         }
         assert_eq!(store.len(), 12);
 
-        // 13th entry forces eviction from shard 0 (the writing shard).
-        store.ingest_partition(0, make_entry(12, "svc", "hot-host"));
+        // 13th entry forces eviction from the writing shard.
+        store.ingest_partition(p, make_entry(12, "svc", "hot-host"));
         assert_eq!(store.len(), 12);
         store.flush_indexer();
 
@@ -744,10 +842,11 @@ mod tests {
 
     #[test]
     fn query_results_only_guarantee_timestamp_order() {
-        let mut store = ChironStore::with_shards(8, 2);
-        store.ingest_partition(0, make_entry(10, "svc", "h1"));
-        store.ingest_partition(1, make_entry(10, "svc", "h2"));
-        store.ingest_partition(0, make_entry(11, "svc", "h3"));
+        // Use ingest() to let the store route each host deterministically.
+        let store = ChironStore::with_shards(100, 4);
+        store.ingest(make_entry(10, "svc", "h1"));
+        store.ingest(make_entry(10, "svc", "h2"));
+        store.ingest(make_entry(11, "svc", "h3"));
         store.flush_indexer();
 
         let result = store.query_by_service("svc", 0, i64::MAX);
@@ -770,10 +869,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("store.snap");
 
-        let mut store = ChironStore::with_shards(12, 3);
-        store.ingest_partition(0, make_entry(10, "auth", "h1"));
-        store.ingest_partition(1, make_entry(20, "payment", "h2"));
-        store.ingest_partition(0, make_entry(30, "auth", "h1"));
+        let store = ChironStore::with_shards(12, 3);
+        // Use ingest() so hosts are routed to the correct shard.
+        store.ingest(make_entry(10, "auth", "h1"));
+        store.ingest(make_entry(20, "payment", "h2"));
+        store.ingest(make_entry(30, "auth", "h1"));
         store.flush_indexer();
 
         let mut offsets = KafkaOffsets::new();
