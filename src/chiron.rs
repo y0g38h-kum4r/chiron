@@ -325,14 +325,15 @@ impl ChironStore {
     pub fn with_shards(total_capacity: usize, shard_count: usize) -> Self {
         assert!(total_capacity > 0, "store capacity must be > 0");
         assert!(shard_count > 0, "shard count must be > 0");
+        assert!(
+            total_capacity.is_multiple_of(shard_count),
+            "store capacity ({total_capacity}) must be divisible by shard count ({shard_count})"
+        );
+
+        let shard_capacity = total_capacity / shard_count;
 
         let shards = (0..shard_count)
-            .map(|shard_id| {
-                Arc::new(PartitionShard::new(
-                    shard_id as u32,
-                    shard_capacity_for_position(total_capacity, shard_count, shard_id),
-                ))
-            })
+            .map(|shard_id| Arc::new(PartitionShard::new(shard_id as u32, shard_capacity)))
             .collect();
 
         Self {
@@ -585,16 +586,6 @@ impl ChironStore {
 
 fn sort_entries(entries: &mut [SharedLogEntry]) {
     entries.sort_unstable_by_key(|entry| entry.timestamp);
-}
-
-fn shard_capacity_for_position(
-    total_capacity: usize,
-    shard_count: usize,
-    position: usize,
-) -> usize {
-    let base = total_capacity / shard_count;
-    let remainder = total_capacity % shard_count;
-    base + usize::from(position < remainder)
 }
 
 #[cfg(test)]
@@ -890,5 +881,11 @@ mod tests {
         assert_eq!(restored_offsets.get("logs", 1), Some(88888));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[should_panic(expected = "must be divisible by shard count")]
+    fn with_shards_requires_uniform_capacity() {
+        let _ = ChironStore::with_shards(10, 3);
     }
 }

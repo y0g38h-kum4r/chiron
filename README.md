@@ -106,7 +106,7 @@ That result shape is best treated as an internal-performance API. If you want a 
 
 The current store still admits writes against one store-level budget, but it carries shard-level capacity metadata too.
 
-- `with_shards(total_capacity, shard_count)` divides the configured capacity into per-shard shares
+- `with_shards(total_capacity, shard_count)` requires uniform per-shard capacity, so `total_capacity` must be divisible by `shard_count`
 - those shard capacities are persisted in snapshots and reconstructed on restore
 - runtime admission is still checked against the store-wide occupancy, not against a hard per-shard quota
 - that means hot shards can temporarily consume more of the live dataset until eviction runs
@@ -222,7 +222,7 @@ The local pipeline entrypoint reads these environment variables:
 - `CHIRON_BROKERS`: Kafka bootstrap servers. Default: `localhost:9092`
 - `CHIRON_TOPIC`: Kafka topic to consume. Default: `chiron-logs`
 - `CHIRON_PARTITIONS`: Kafka partition count and shard count. Default: `4`
-- `CHIRON_CAPACITY`: total in-memory capacity distributed across shards. Default: `100000`
+- `CHIRON_CAPACITY`: total in-memory capacity distributed uniformly across shards. Must be divisible by `CHIRON_PARTITIONS`. Default: `100000`
 - `CHIRON_CONSUMER_GROUP`: consumer group id. Default: `chiron-pipeline`
 - `CHIRON_CONSUMER_THREADS`: number of consumer threads to start. Default: `CHIRON_PARTITIONS`
 - `CHIRON_CONSUMER_BATCH_SIZE`: max messages to ingest per batch. Default: `256`
