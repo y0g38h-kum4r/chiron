@@ -65,7 +65,7 @@ Host-scoped queries do not need a mutable routing table anymore. They compute th
 
 Each shard indexes accepted records inline while already holding its write lock, so the common ingest path does not accumulate index lag. The store still exposes `flush_indexer()` and `flush_indexer_shard(shard_id)`, but they are now mostly compatibility and recovery helpers.
 
-The demo pipeline and `e2e_bench` still carry a background indexer thread that periodically calls `flush_indexer()`. With inline indexing in place, that loop is largely redundant and should be removed unless you want to keep it as a defensive no-op.
+`e2e_bench` still carries a background indexer thread for benchmark instrumentation. The main pipeline path no longer depends on that loop.
 
 ### Commit vs. Searchability
 
@@ -176,11 +176,11 @@ For offline snapshots taken after ingestion stops, this is fine. For live stream
 ```text
 src/
 ├── lib.rs               # Module declarations
-├── main.rs              # Demo entrypoint
+├── main.rs              # Env-driven pipeline entrypoint
 ├── log_entry.rs         # Owned API LogEntry + shared-string store entry type
 ├── inverted_index.rs    # Local service/host posting lists
 ├── kafka.rs             # Kafka producer/consumer wrappers
-├── pipeline.rs          # Kafka pipeline (still includes a legacy indexer loop)
+├── pipeline.rs          # Env-driven Kafka consume/ingest startup
 ├── snapshot.rs          # Snapshot encoding/decoding
 └── chiron.rs            # Shard-aware ChironStore
 ```
@@ -217,22 +217,29 @@ If no broker is reachable at `localhost:9092`, the E2E tests skip with a message
 
 ## Configuration
 
-The local demo reads these environment variables:
+The local pipeline entrypoint reads these environment variables:
 
-- `CHIRON_NUM_PARTITIONS`: Kafka topic partition count and shard count used by the pipeline. Default: `4`
-- `CHIRON_RING_BUFFER_CAPACITY`: total in-memory capacity distributed across shards. Default: `100000`
-- `CHIRON_INDEX_FLUSH_INTERVAL_MS`: legacy background indexer flush interval in milliseconds. Default: `50`
+- `CHIRON_BROKERS`: Kafka bootstrap servers. Default: `localhost:9092`
+- `CHIRON_TOPIC`: Kafka topic to consume. Default: `chiron-logs`
+- `CHIRON_PARTITIONS`: Kafka partition count and shard count. Default: `4`
+- `CHIRON_CAPACITY`: total in-memory capacity distributed across shards. Default: `100000`
+- `CHIRON_CONSUMER_GROUP`: consumer group id. Default: `chiron-pipeline`
+- `CHIRON_CONSUMER_THREADS`: number of consumer threads to start. Default: `CHIRON_PARTITIONS`
+- `CHIRON_CONSUMER_BATCH_SIZE`: max messages to ingest per batch. Default: `256`
+- `CHIRON_CONSUMER_POLL_MS`: poll timeout in milliseconds. Default: `200`
+- `CHIRON_CONSUMER_IDLE_MS`: idle timeout before the pipeline exits. Default: `5000`
 
 Example:
 
 ```bash
-export CHIRON_NUM_PARTITIONS=8
-export CHIRON_RING_BUFFER_CAPACITY=250000
-export CHIRON_INDEX_FLUSH_INTERVAL_MS=25
+export CHIRON_BROKERS=localhost:9092
+export CHIRON_TOPIC=chiron-logs
+export CHIRON_PARTITIONS=8
+export CHIRON_CAPACITY=250000
+export CHIRON_CONSUMER_GROUP=chiron-pipeline
+export CHIRON_CONSUMER_THREADS=8
 docker compose up -d
 cargo run
 ```
 
-`docker-compose.yml` also uses `CHIRON_NUM_PARTITIONS` for Kafka's `KAFKA_NUM_PARTITIONS`, so keeping that env var aligned makes the demo behavior more predictable.
-
-`CHIRON_INDEX_FLUSH_INTERVAL_MS` is now mostly a compatibility knob. Since ingest indexes inline, changing it should have little to no effect on live-query freshness, and removing the background indexer thread entirely would simplify the benchmark path.
+`docker-compose.yml` also uses `CHIRON_NUM_PARTITIONS` for Kafka's `KAFKA_NUM_PARTITIONS`, and the pipeline still accepts `CHIRON_NUM_PARTITIONS` / `CHIRON_RING_BUFFER_CAPACITY` as compatibility fallbacks if you already have those env vars set.

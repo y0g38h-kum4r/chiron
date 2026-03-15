@@ -1,45 +1,55 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::{env, fmt::Display};
 
 use crate::chiron::ChironStore;
-use crate::kafka::{ChironConsumer, ChironKafkaError, ChironProducer};
+use crate::kafka::{ChironConsumer, ChironKafkaError};
 use crate::log_entry::LogEntry;
 use crate::snapshot::KafkaOffsets;
 
-/// Configuration for the pipeline.
+/// Configuration for the Kafka -> Chiron ingest pipeline.
 pub struct PipelineConfig {
     pub brokers: String,
     pub topic: String,
     pub num_partitions: u32,
-    pub ring_buffer_capacity: usize,
-    pub services: Vec<String>,
-    pub hosts: Vec<String>,
-    pub logs_per_producer: u64,
+    pub capacity: usize,
     pub consumer_group: String,
-    pub index_flush_interval: Duration,
+    pub consumer_threads: usize,
+    pub consumer_batch_size: usize,
+    pub consumer_poll_timeout: Duration,
+    pub consumer_idle_timeout: Duration,
 }
 
 impl PipelineConfig {
-    /// Convenience constructor with sensible defaults for local Docker Kafka.
-    pub fn local(services: Vec<String>, hosts: Vec<String>, logs_per_producer: u64) -> Self {
+    /// Read the pipeline configuration from environment variables.
+    pub fn from_env() -> Self {
+        let num_partitions = env_u32("CHIRON_PARTITIONS", env_u32("CHIRON_NUM_PARTITIONS", 4));
+        let capacity = env_usize(
+            "CHIRON_CAPACITY",
+            env_usize("CHIRON_RING_BUFFER_CAPACITY", 100_000),
+        );
+
         Self {
-            brokers: "localhost:9092".to_string(),
-            topic: "chiron-logs".to_string(),
-            num_partitions: env_u32("CHIRON_NUM_PARTITIONS", 4),
-            ring_buffer_capacity: env_usize("CHIRON_RING_BUFFER_CAPACITY", 100_000),
-            services,
-            hosts,
-            logs_per_producer,
-            consumer_group: "chiron-pipeline".to_string(),
-            index_flush_interval: Duration::from_millis(env_u64(
-                "CHIRON_INDEX_FLUSH_INTERVAL_MS",
-                50,
-            )),
+            brokers: env_string("CHIRON_BROKERS", "localhost:9092"),
+            topic: env_string("CHIRON_TOPIC", "chiron-logs"),
+            num_partitions,
+            capacity,
+            consumer_group: env_string("CHIRON_CONSUMER_GROUP", "chiron-pipeline"),
+            consumer_threads: env_usize("CHIRON_CONSUMER_THREADS", num_partitions as usize).max(1),
+            consumer_batch_size: env_usize("CHIRON_CONSUMER_BATCH_SIZE", 256).max(1),
+            consumer_poll_timeout: Duration::from_millis(
+                env_u64("CHIRON_CONSUMER_POLL_MS", 200).max(1),
+            ),
+            consumer_idle_timeout: Duration::from_millis(
+                env_u64("CHIRON_CONSUMER_IDLE_MS", 5_000).max(1),
+            ),
         }
     }
+}
+
+fn env_string(name: &str, default: &str) -> String {
+    env::var(name).unwrap_or_else(|_| default.to_string())
 }
 
 fn env_u32(name: &str, default: u32) -> u32 {
@@ -74,172 +84,67 @@ where
     }
 }
 
-/// Stats collected from the pipeline run.
+/// Stats collected from a pipeline run.
 pub struct PipelineStats {
-    pub total_produced: u64,
     pub total_consumed: u64,
-    pub produce_duration: Duration,
     pub consume_duration: Duration,
     pub pipeline_duration: Duration,
     pub kafka_offsets: KafkaOffsets,
-    pub index_flushes: u64,
-    pub max_indexer_lag: u64,
 }
 
-/// A dummy log-producing service running on a host.
-/// Each producer generates logs for a specific (service, host) pair.
-struct DummyService {
-    service_name: String,
-    host_id: String,
-    producer: ChironProducer,
-    logs_to_produce: u64,
-}
-
-impl DummyService {
-    fn run(self) -> Result<u64, ChironKafkaError> {
-        let start_ts = 1_000_000i64; // base timestamp
-        for i in 0..self.logs_to_produce {
-            let entry = LogEntry {
-                timestamp: start_ts + i as i64,
-                service_name: self.service_name.clone(),
-                host_id: self.host_id.clone(),
-                message: format!("{} on {} event {}", self.service_name, self.host_id, i),
-            };
-            self.producer.send(&entry)?;
-        }
-        self.producer.flush(Duration::from_secs(10))?;
-        Ok(self.logs_to_produce)
-    }
-}
-
-/// Run the full pipeline:
-/// 1. Spawn producer threads (one per service×host pair)
-/// 2. Wait for all producers to finish
-/// 3. Spawn consumer threads (one per Kafka partition)
-/// 4. Each consumer ingests into the shared ChironStore
-/// 5. Wait for all consumers
-/// 6. Flush indexer, return stats
+/// Start the Kafka -> store ingest pipeline and drain until the consumer group
+/// has been idle for `consumer_idle_timeout`.
 pub fn run_pipeline(
     config: PipelineConfig,
 ) -> Result<(Arc<ChironStore>, PipelineStats), ChironKafkaError> {
     let store = Arc::new(ChironStore::with_shards(
-        config.ring_buffer_capacity,
+        config.capacity,
         config.num_partitions as usize,
     ));
-    let producers_done = Arc::new(AtomicBool::new(false));
-    let consumers_done = Arc::new(AtomicBool::new(false));
-    let max_indexer_lag = Arc::new(AtomicU64::new(0));
 
     let pipeline_start = Instant::now();
-
-    // --- Spawn consumers first so ingestion happens live while producers are active ---
     let consume_start = Instant::now();
     let mut consumer_threads = Vec::new();
 
-    for _partition in 0..config.num_partitions {
+    for _ in 0..config.consumer_threads {
         let store_clone = Arc::clone(&store);
-        let producers_done = Arc::clone(&producers_done);
         let brokers = config.brokers.clone();
         let topic = config.topic.clone();
         let group = config.consumer_group.clone();
+        let batch_size = config.consumer_batch_size;
+        let poll_timeout = config.consumer_poll_timeout;
+        let idle_timeout = config.consumer_idle_timeout;
 
         consumer_threads.push(thread::spawn(move || {
-            consume_partition(&brokers, &topic, &group, store_clone, producers_done)
+            consume_partition(
+                &brokers,
+                &topic,
+                &group,
+                store_clone,
+                batch_size,
+                poll_timeout,
+                idle_timeout,
+            )
         }));
     }
 
-    // --- Spawn a background indexer to keep queries warm during ingestion ---
-    let index_store = Arc::clone(&store);
-    let index_done = Arc::clone(&consumers_done);
-    let index_flush_interval = config.index_flush_interval;
-    let index_lag_metric = Arc::clone(&max_indexer_lag);
-    let indexer_thread = thread::spawn(move || {
-        let mut flushes = 0u64;
-
-        loop {
-            {
-                index_store.flush_indexer();
-                flushes += 1;
-                update_max_atomic(&index_lag_metric, index_store.indexer_lag());
-            }
-
-            if index_done.load(Ordering::SeqCst) {
-                let lag = index_store.indexer_lag();
-                update_max_atomic(&index_lag_metric, lag);
-                if lag == 0 {
-                    break;
-                }
-            }
-
-            thread::sleep(index_flush_interval);
-        }
-
-        flushes
-    });
-
-    // --- Spawn producers ---
-    let produce_start = Instant::now();
-    let mut producer_threads = Vec::new();
-
-    for svc in &config.services {
-        for host in &config.hosts {
-            let svc_name = svc.clone();
-            let host_id = host.clone();
-            let brokers = config.brokers.clone();
-            let topic = config.topic.clone();
-            let logs = config.logs_per_producer;
-
-            let num_partitions = config.num_partitions as usize;
-            producer_threads.push(thread::spawn(move || {
-                let producer = ChironProducer::new(&brokers, &topic, num_partitions)?;
-                let dummy = DummyService {
-                    service_name: svc_name,
-                    host_id,
-                    producer,
-                    logs_to_produce: logs,
-                };
-                dummy.run()
-            }));
-        }
-    }
-
-    // Wait for all producers to finish.
-    let mut total_produced = 0u64;
-    for t in producer_threads {
-        total_produced += join_thread_result(t)?;
-    }
-    let produce_duration = produce_start.elapsed();
-    producers_done.store(true, Ordering::SeqCst);
-
-    // Wait for all consumers.
     let mut total_consumed = 0u64;
     let mut kafka_offsets = KafkaOffsets::new();
-    for t in consumer_threads {
-        let (count, offsets) = join_thread_result(t)?;
+    for thread_handle in consumer_threads {
+        let (count, offsets) = join_thread_result(thread_handle)?;
         total_consumed += count;
-        // Merge offsets from each consumer thread.
         for (topic_name, partitions) in offsets.inner() {
             for (&partition, &offset) in partitions {
-                kafka_offsets.set(&topic_name, partition, offset);
+                kafka_offsets.set(topic_name, partition, offset);
             }
         }
     }
-    consumers_done.store(true, Ordering::SeqCst);
-    let consume_duration = consume_start.elapsed();
-    let index_flushes = indexer_thread
-        .join()
-        .map_err(|_| ChironKafkaError::ThreadPanic("indexer thread panicked"))?;
-    let pipeline_duration = pipeline_start.elapsed();
 
     let stats = PipelineStats {
-        total_produced,
         total_consumed,
-        produce_duration,
-        consume_duration,
-        pipeline_duration,
+        consume_duration: consume_start.elapsed(),
+        pipeline_duration: pipeline_start.elapsed(),
         kafka_offsets,
-        index_flushes,
-        max_indexer_lag: max_indexer_lag.load(Ordering::SeqCst),
     };
 
     Ok((store, stats))
@@ -253,14 +158,13 @@ fn consume_partition(
     topic: &str,
     group: &str,
     store: Arc<ChironStore>,
-    producers_done: Arc<AtomicBool>,
+    batch_size: usize,
+    poll_timeout: Duration,
+    idle_timeout: Duration,
 ) -> Result<(u64, KafkaOffsets), ChironKafkaError> {
     let consumer = ChironConsumer::new(brokers, topic, group)?;
     let mut count = 0u64;
-    let mut batch: Vec<(LogEntry, u32)> = Vec::with_capacity(256);
-
-    let poll_timeout = Duration::from_millis(200);
-    let idle_deadline = Duration::from_secs(5);
+    let mut batch: Vec<(LogEntry, u32)> = Vec::with_capacity(batch_size);
     let mut last_message_time = Instant::now();
 
     loop {
@@ -270,9 +174,8 @@ fn consume_partition(
                 count += 1;
                 last_message_time = Instant::now();
 
-                // Try to batch more.
-                while batch.len() < 256 {
-                    match consumer.poll(Duration::from_millis(10)) {
+                while batch.len() < batch_size {
+                    match consumer.poll(Duration::ZERO) {
                         Ok(Some((entry, partition, _))) => {
                             batch.push((entry, partition as u32));
                             count += 1;
@@ -283,17 +186,11 @@ fn consume_partition(
                     }
                 }
 
-                // Ingest batch into the partition-local shards first so a crash
-                // cannot acknowledge records that were never accepted locally.
                 ingest_batch_by_partition(&store, &mut batch);
-
                 consumer.commit()?;
             }
             Ok(None) => {
-                // No message — quit once producers are done and the stream has been idle.
-                if producers_done.load(Ordering::SeqCst)
-                    && last_message_time.elapsed() >= idle_deadline
-                {
+                if last_message_time.elapsed() >= idle_timeout {
                     break;
                 }
             }
@@ -301,7 +198,6 @@ fn consume_partition(
         }
     }
 
-    // Collect committed offsets.
     let mut offsets = KafkaOffsets::new();
     for (partition, offset) in consumer.committed_offsets(Duration::from_secs(5)) {
         if offset >= 0 {
@@ -310,16 +206,6 @@ fn consume_partition(
     }
 
     Ok((count, offsets))
-}
-
-fn update_max_atomic(target: &AtomicU64, candidate: u64) {
-    let mut current = target.load(Ordering::Relaxed);
-    while candidate > current {
-        match target.compare_exchange(current, candidate, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => break,
-            Err(observed) => current = observed,
-        }
-    }
 }
 
 fn join_thread_result<T>(
