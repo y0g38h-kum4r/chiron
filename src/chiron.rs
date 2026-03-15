@@ -3,9 +3,10 @@ use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use crate::inverted_index::InvertedIndex;
-use crate::log_entry::LogEntry;
+use crate::log_entry::{LogEntry, SharedLogEntry};
 use crate::snapshot::{KafkaOffsets, RestoredShard, Snapshot, SnapshotShard};
 
 /// Partition-local Chiron store.
@@ -32,13 +33,38 @@ struct PartitionShard {
 }
 
 struct PartitionBuffer {
-    entries: VecDeque<LogEntry>,
+    entries: VecDeque<SharedLogEntry>,
     oldest_offset: u64,
     next_offset: u64,
 }
 
 pub struct QueryResult {
     pub entries: Vec<LogEntry>,
+}
+
+pub struct SharedQueryResult {
+    pub entries: Vec<SharedLogEntry>,
+}
+
+#[derive(Default, Clone, Copy, Debug)]
+pub struct HostQueryProfile {
+    pub shards_touched: usize,
+    pub hits: usize,
+    pub posting_list_scan: Duration,
+    pub materialize: Duration,
+    pub sort: Duration,
+    pub total: Duration,
+}
+
+impl HostQueryProfile {
+    fn accumulate(&mut self, other: HostQueryProfile) {
+        self.shards_touched += other.shards_touched;
+        self.hits += other.hits;
+        self.posting_list_scan += other.posting_list_scan;
+        self.materialize += other.materialize;
+        self.sort += other.sort;
+        self.total += other.total;
+    }
 }
 
 impl PartitionBuffer {
@@ -61,18 +87,18 @@ impl PartitionBuffer {
         Ok(Self {
             oldest_offset: next_offset - entries.len() as u64,
             next_offset,
-            entries: entries.into(),
+            entries: entries.into_iter().map(SharedLogEntry::from).collect(),
         })
     }
 
-    fn push(&mut self, entry: LogEntry) -> u64 {
+    fn push(&mut self, entry: SharedLogEntry) -> u64 {
         let offset = self.next_offset;
         self.entries.push_back(entry);
         self.next_offset += 1;
         offset
     }
 
-    fn get(&self, offset: u64) -> Option<&LogEntry> {
+    fn get(&self, offset: u64) -> Option<&SharedLogEntry> {
         if offset < self.oldest_offset || offset >= self.next_offset {
             return None;
         }
@@ -102,8 +128,8 @@ impl PartitionBuffer {
         self.oldest_offset
     }
 
-    fn entries_cloned(&self) -> Vec<LogEntry> {
-        self.entries.iter().cloned().collect()
+    fn entries_owned(&self) -> Vec<LogEntry> {
+        self.entries.iter().map(LogEntry::from).collect()
     }
 }
 
@@ -130,29 +156,17 @@ impl PartitionShard {
         })
     }
 
-    fn ingest(&mut self, entry: LogEntry) -> u64 {
+    fn ingest(&mut self, entry: SharedLogEntry) -> u64 {
         self.buffer.push(entry)
     }
 
-    fn flush_indexer(&mut self, host_routes: &mut HashMap<String, u32>) {
+    fn flush_indexer(&mut self) {
         let write_head = self.buffer.next_offset();
         while self.indexer_pos < write_head {
             if let Some(entry) = self.buffer.get(self.indexer_pos) {
                 self.service_index
                     .insert(&entry.service_name, self.indexer_pos);
                 self.host_index.insert(&entry.host_id, self.indexer_pos);
-                match host_routes.get(&entry.host_id) {
-                    Some(existing_shard_id) if *existing_shard_id != self.shard_id => {
-                        panic!(
-                            "host {} was indexed into multiple shards: {} and {}",
-                            entry.host_id, existing_shard_id, self.shard_id
-                        );
-                    }
-                    Some(_) => {}
-                    None => {
-                        host_routes.insert(entry.host_id.clone(), self.shard_id);
-                    }
-                }
             }
             self.indexer_pos += 1;
         }
@@ -163,11 +177,85 @@ impl PartitionShard {
     }
 
     fn query_by_service(&self, service: &str, t1: i64, t2: i64) -> Vec<LogEntry> {
-        self.collect_entries(self.service_index.get(service), t1, t2)
+        self.collect_owned_entries(self.service_index.get(service), t1, t2)
+    }
+
+    fn query_by_service_shared(&self, service: &str, t1: i64, t2: i64) -> Vec<SharedLogEntry> {
+        self.collect_shared_entries(self.service_index.get(service), t1, t2)
     }
 
     fn query_by_host(&self, host: &str, t1: i64, t2: i64) -> Vec<LogEntry> {
-        self.collect_entries(self.host_index.get(host), t1, t2)
+        self.collect_owned_entries(self.host_index.get(host), t1, t2)
+    }
+
+    fn query_by_host_shared(&self, host: &str, t1: i64, t2: i64) -> Vec<SharedLogEntry> {
+        self.collect_shared_entries(self.host_index.get(host), t1, t2)
+    }
+
+    fn query_by_host_profiled(
+        &self,
+        host: &str,
+        t1: i64,
+        t2: i64,
+    ) -> (Vec<LogEntry>, HostQueryProfile) {
+        let (entries, profile) = self.query_by_host_shared_profiled(host, t1, t2);
+        let materialize_started = Instant::now();
+        let owned_entries = entries.iter().map(LogEntry::from).collect();
+        let extra_materialize = materialize_started.elapsed();
+        (
+            owned_entries,
+            HostQueryProfile {
+                materialize: profile.materialize + extra_materialize,
+                total: profile.total + extra_materialize,
+                ..profile
+            },
+        )
+    }
+
+    fn query_by_host_shared_profiled(
+        &self,
+        host: &str,
+        t1: i64,
+        t2: i64,
+    ) -> (Vec<SharedLogEntry>, HostQueryProfile) {
+        let total_started = Instant::now();
+        let Some(offsets) = self.host_index.get(host) else {
+            return (vec![], HostQueryProfile::default());
+        };
+
+        let scan_started = Instant::now();
+        let mut matching_offsets = Vec::with_capacity(offsets.len());
+        for &offset in offsets {
+            if let Some(entry) = self.buffer.get(offset) {
+                if entry.timestamp >= t1 && entry.timestamp <= t2 {
+                    matching_offsets.push(offset);
+                }
+            }
+        }
+        let posting_list_scan = scan_started.elapsed();
+
+        let materialize_started = Instant::now();
+        let mut entries = Vec::with_capacity(matching_offsets.len());
+        for offset in matching_offsets {
+            if let Some(entry) = self.buffer.get(offset) {
+                entries.push(entry.clone());
+            }
+        }
+        let materialize = materialize_started.elapsed();
+
+        let hits = entries.len();
+        let total = total_started.elapsed();
+        (
+            entries,
+            HostQueryProfile {
+                shards_touched: 1,
+                hits,
+                posting_list_scan,
+                materialize,
+                sort: Duration::ZERO,
+                total,
+            },
+        )
     }
 
     fn query_by_service_and_host(
@@ -177,6 +265,19 @@ impl PartitionShard {
         t1: i64,
         t2: i64,
     ) -> Vec<LogEntry> {
+        self.query_by_service_and_host_shared(service, host, t1, t2)
+            .iter()
+            .map(LogEntry::from)
+            .collect()
+    }
+
+    fn query_by_service_and_host_shared(
+        &self,
+        service: &str,
+        host: &str,
+        t1: i64,
+        t2: i64,
+    ) -> Vec<SharedLogEntry> {
         let Some(service_offsets) = self.service_index.get(service) else {
             return vec![];
         };
@@ -207,7 +308,19 @@ impl PartitionShard {
         entries
     }
 
-    fn collect_entries(&self, offsets: Option<&[u64]>, t1: i64, t2: i64) -> Vec<LogEntry> {
+    fn collect_owned_entries(&self, offsets: Option<&[u64]>, t1: i64, t2: i64) -> Vec<LogEntry> {
+        self.collect_shared_entries(offsets, t1, t2)
+            .iter()
+            .map(LogEntry::from)
+            .collect()
+    }
+
+    fn collect_shared_entries(
+        &self,
+        offsets: Option<&[u64]>,
+        t1: i64,
+        t2: i64,
+    ) -> Vec<SharedLogEntry> {
         match offsets {
             None => vec![],
             Some(offsets) => offsets
@@ -272,8 +385,10 @@ impl ChironStore {
     /// Append using the store's host-based sharding strategy.
     pub fn ingest(&mut self, entry: LogEntry) -> u64 {
         let shard_id = self.route_host_to_shard(&entry.host_id);
+        let shard_route = self.shards[shard_id].shard_id;
+        self.register_host_route(&entry.host_id, shard_route);
         self.evict_while_full_for_shard(shard_id);
-        let offset = self.shards[shard_id].ingest(entry);
+        let offset = self.shards[shard_id].ingest(entry.into());
         self.live_len += 1;
         offset
     }
@@ -281,16 +396,23 @@ impl ChironStore {
     /// Append directly into the shard that corresponds to a Kafka partition.
     pub fn ingest_partition(&mut self, partition_id: u32, entry: LogEntry) -> u64 {
         let position = self.ensure_shard(partition_id);
+        let shard_route = self.shards[position].shard_id;
+        self.register_host_route(&entry.host_id, shard_route);
         self.evict_while_full_for_shard(position);
-        let offset = self.shards[position].ingest(entry);
+        let offset = self.shards[position].ingest(entry.into());
         self.live_len += 1;
         offset
     }
 
     pub fn flush_indexer(&mut self) {
-        let host_routes = &mut self.host_routes;
         for shard in &mut self.shards {
-            shard.flush_indexer(host_routes);
+            shard.flush_indexer();
+        }
+    }
+
+    pub fn flush_indexer_shard(&mut self, shard_id: u32) {
+        if let Some(position) = self.shard_position(shard_id) {
+            self.shards[position].flush_indexer();
         }
     }
 
@@ -307,6 +429,15 @@ impl ChironStore {
         QueryResult { entries }
     }
 
+    pub fn query_by_service_shared(&self, service: &str, t1: i64, t2: i64) -> SharedQueryResult {
+        let mut entries = Vec::new();
+        for shard in &self.shards {
+            entries.extend(shard.query_by_service_shared(service, t1, t2));
+        }
+        sort_shared_entries(&mut entries);
+        SharedQueryResult { entries }
+    }
+
     pub fn query_by_host(&self, host: &str, t1: i64, t2: i64) -> QueryResult {
         let mut entries = Vec::new();
         if let Some(shard_idx) = self.shard_position_for_host(host) {
@@ -318,6 +449,84 @@ impl ChironStore {
         }
         sort_entries(&mut entries);
         QueryResult { entries }
+    }
+
+    pub fn query_by_host_shared(&self, host: &str, t1: i64, t2: i64) -> SharedQueryResult {
+        let mut entries = Vec::new();
+        if let Some(shard_idx) = self.shard_position_for_host(host) {
+            entries.extend(self.shards[shard_idx].query_by_host_shared(host, t1, t2));
+        } else {
+            for shard in &self.shards {
+                entries.extend(shard.query_by_host_shared(host, t1, t2));
+            }
+        }
+        sort_shared_entries(&mut entries);
+        SharedQueryResult { entries }
+    }
+
+    pub fn query_by_host_profiled(
+        &self,
+        host: &str,
+        t1: i64,
+        t2: i64,
+    ) -> (QueryResult, HostQueryProfile) {
+        let total_started = Instant::now();
+        let mut entries = Vec::new();
+        let mut profile = HostQueryProfile::default();
+
+        if let Some(shard_idx) = self.shard_position_for_host(host) {
+            let (shard_entries, shard_profile) =
+                self.shards[shard_idx].query_by_host_profiled(host, t1, t2);
+            entries.extend(shard_entries);
+            profile.accumulate(shard_profile);
+        } else {
+            for shard in &self.shards {
+                let (shard_entries, shard_profile) = shard.query_by_host_profiled(host, t1, t2);
+                entries.extend(shard_entries);
+                profile.accumulate(shard_profile);
+            }
+        }
+
+        let sort_started = Instant::now();
+        sort_entries(&mut entries);
+        profile.sort = sort_started.elapsed();
+        profile.hits = entries.len();
+        profile.total = total_started.elapsed();
+
+        (QueryResult { entries }, profile)
+    }
+
+    pub fn query_by_host_shared_profiled(
+        &self,
+        host: &str,
+        t1: i64,
+        t2: i64,
+    ) -> (SharedQueryResult, HostQueryProfile) {
+        let total_started = Instant::now();
+        let mut entries = Vec::new();
+        let mut profile = HostQueryProfile::default();
+
+        if let Some(shard_idx) = self.shard_position_for_host(host) {
+            let (shard_entries, shard_profile) =
+                self.shards[shard_idx].query_by_host_shared_profiled(host, t1, t2);
+            entries.extend(shard_entries);
+            profile.accumulate(shard_profile);
+        } else {
+            for shard in &self.shards {
+                let (shard_entries, shard_profile) =
+                    shard.query_by_host_shared_profiled(host, t1, t2);
+                entries.extend(shard_entries);
+                profile.accumulate(shard_profile);
+            }
+        }
+
+        let sort_started = Instant::now();
+        sort_shared_entries(&mut entries);
+        profile.sort = sort_started.elapsed();
+        profile.hits = entries.len();
+        profile.total = total_started.elapsed();
+
+        (SharedQueryResult { entries }, profile)
     }
 
     pub fn query_by_service_and_host(
@@ -339,6 +548,26 @@ impl ChironStore {
         QueryResult { entries }
     }
 
+    pub fn query_by_service_and_host_shared(
+        &self,
+        service: &str,
+        host: &str,
+        t1: i64,
+        t2: i64,
+    ) -> SharedQueryResult {
+        let mut entries = Vec::new();
+        if let Some(shard_idx) = self.shard_position_for_host(host) {
+            entries.extend(
+                self.shards[shard_idx].query_by_service_and_host_shared(service, host, t1, t2),
+            );
+        } else {
+            for shard in &self.shards {
+                entries.extend(shard.query_by_service_and_host_shared(service, host, t1, t2));
+            }
+        }
+        sort_shared_entries(&mut entries);
+        SharedQueryResult { entries }
+    }
 
     pub fn len(&self) -> usize {
         self.live_len
@@ -356,12 +585,12 @@ impl ChironStore {
         let shards: Vec<_> = self
             .shards
             .iter()
-                .map(|shard| SnapshotShard {
-                    shard_id: shard.shard_id,
-                    capacity: shard.capacity(),
-                    next_offset: shard.buffer.next_offset(),
-                    entries: shard.buffer.entries_cloned(),
-                })
+            .map(|shard| SnapshotShard {
+                shard_id: shard.shard_id,
+                capacity: shard.capacity(),
+                next_offset: shard.buffer.next_offset(),
+                entries: shard.buffer.entries_owned(),
+            })
             .collect();
 
         Snapshot::save_sharded(path, &shards, kafka_offsets)
@@ -390,6 +619,7 @@ impl ChironStore {
             total_capacity,
             live_len,
         };
+        store.rebuild_host_routes();
         store.flush_indexer();
 
         Ok((store, kafka_offsets))
@@ -471,13 +701,51 @@ impl ChironStore {
 
         self.shards.len() - 1
     }
+
+    fn register_host_route(&mut self, host: &str, shard_id: u32) {
+        match self.host_routes.get(host) {
+            Some(existing_shard_id) if *existing_shard_id != shard_id => {
+                panic!(
+                    "host {} was indexed into multiple shards: {} and {}",
+                    host, existing_shard_id, shard_id
+                );
+            }
+            Some(_) => {}
+            None => {
+                self.host_routes.insert(host.to_string(), shard_id);
+            }
+        }
+    }
+
+    fn rebuild_host_routes(&mut self) {
+        self.host_routes.clear();
+        let mut routes = Vec::new();
+
+        for shard in &self.shards {
+            for entry in &shard.buffer.entries {
+                routes.push((entry.host_id.clone(), shard.shard_id));
+            }
+        }
+
+        for (host, shard_id) in routes {
+            self.register_host_route(&host, shard_id);
+        }
+    }
 }
 
 fn sort_entries(entries: &mut [LogEntry]) {
     entries.sort_unstable_by_key(|entry| entry.timestamp);
 }
 
-fn shard_capacity_for_position(total_capacity: usize, shard_count: usize, position: usize) -> usize {
+fn sort_shared_entries(entries: &mut [SharedLogEntry]) {
+    entries.sort_unstable_by_key(|entry| entry.timestamp);
+}
+
+fn shard_capacity_for_position(
+    total_capacity: usize,
+    shard_count: usize,
+    position: usize,
+) -> usize {
     let base = total_capacity / shard_count;
     let remainder = total_capacity % shard_count;
     base + usize::from(position < remainder)
@@ -549,6 +817,22 @@ mod tests {
         let result = store.query_by_service_and_host("auth", "h1", 0, 100);
         assert_eq!(result.entries.len(), 1);
         assert_eq!(result.entries[0].timestamp, 10);
+    }
+
+    #[test]
+    fn shard_local_flush_only_indexes_that_shard() {
+        let mut store = ChironStore::with_shards(12, 2);
+        store.ingest_partition(0, make_entry(10, "auth", "h0"));
+        store.ingest_partition(1, make_entry(20, "auth", "h1"));
+
+        store.flush_indexer_shard(1);
+
+        let h0 = store.query_by_host("h0", 0, 100);
+        assert!(h0.entries.is_empty());
+
+        let h1 = store.query_by_host("h1", 0, 100);
+        assert_eq!(h1.entries.len(), 1);
+        assert_eq!(h1.entries[0].timestamp, 20);
     }
 
     #[test]
@@ -626,8 +910,6 @@ mod tests {
         let mut store = ChironStore::with_shards(12, 4);
         store.ingest_partition(0, make_entry(10, "auth", "h1"));
         store.ingest_partition(1, make_entry(20, "auth", "h1"));
-
-        store.flush_indexer();
     }
 
     #[test]

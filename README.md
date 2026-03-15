@@ -59,11 +59,11 @@ Each shard maintains local inverted indexes:
 - `service_name -> [local shard offsets]`
 - `host_id -> [local shard offsets]`
 
-The store also maintains a `host_routes` map while indexing so host-scoped queries can go straight to the single shard that owns that host.
+The store also maintains a `host_routes` map on ingest so host-scoped queries can go straight to the single shard that owns that host even before indexing catches up.
 
-The intended invariant is strict: a given `host_id` must never appear in multiple shards. If indexing observes the same host in different shards, the store treats that as a bug and fails fast.
+The intended invariant is strict: a given `host_id` must never appear in multiple shards. If ingest or recovery observes the same host in different shards, the store treats that as a bug and fails fast.
 
-The current pipeline runs a background indexer thread that periodically calls `flush_indexer()` across all shards. Query freshness therefore depends on indexer lag.
+The current pipeline runs a background indexer thread that periodically calls `flush_indexer()` across all shards. The indexing work itself is shard-local, and the store also exposes `flush_indexer_shard(shard_id)` for targeted flushes. Query freshness therefore still depends on indexer lag.
 
 ### Commit vs. Searchability
 
@@ -73,6 +73,7 @@ That creates a small window where:
 
 - a record has been committed in Kafka
 - the record is present in the shard buffer
+- the host route is already known
 - but `ByService` / `ByHost` / `ByServiceAndHost` may not return it yet because the background indexer has not flushed that shard
 
 On a clean run, the background indexer catches up before the pipeline exits. During live ingestion, though, queries are only as fresh as the current indexer lag.
@@ -82,7 +83,7 @@ On a clean run, the background indexer catches up before the pipeline exits. Dur
 ### `ByHost(host, t1, t2)`
 
 - use `host_routes` when available to query only the known shard for that host
-- fall back to fanout if the host has not been indexed yet
+- fall back to fanout only when the host has never been seen locally or routing metadata is otherwise unavailable
 
 ### `ByServiceAndHost(service, host, t1, t2)`
 
@@ -152,9 +153,10 @@ The snapshot write path is durable:
 Recovery does the following:
 
 1. Load every shard from the snapshot file.
-2. Rebuild shard-local indexes by calling `flush_indexer()`.
-3. Restore Kafka offsets from the snapshot.
-4. Resume consumers from those offsets and replay forward.
+2. Rebuild `host_routes` from the buffered shard contents.
+3. Rebuild shard-local indexes by calling `flush_indexer()`.
+4. Restore Kafka offsets from the snapshot.
+5. Resume consumers from those offsets and replay forward.
 
 ### Important Snapshot Limitation
 
@@ -175,7 +177,7 @@ For offline snapshots taken after ingestion stops, this is fine. For live stream
 src/
 ├── lib.rs               # Module declarations
 ├── main.rs              # Demo entrypoint
-├── log_entry.rs         # LogEntry struct
+├── log_entry.rs         # Owned API LogEntry + shared-string store entry type
 ├── inverted_index.rs    # Local service/host posting lists
 ├── kafka.rs             # Kafka producer/consumer wrappers
 ├── pipeline.rs          # Kafka pipeline and background indexer
@@ -193,14 +195,16 @@ cargo run
 cargo test
 ```
 
+Store-only Rust benchmark:
+
+```bash
+cargo run --release --bin bench
+```
+
 Kafka integration tests are ignored by default:
 
 ```bash
 cargo test --test e2e -- --ignored --nocapture
-```
-
-```bash
-cargo test --release --test e2e kafka_1m_ingest_and_10k_queries -- --ignored --nocapture
 ```
 
 Go benchmark:
@@ -210,9 +214,35 @@ cd go_three_maps
 go run .
 ```
 
-The Go benchmark now mirrors the streaming-style Rust load test: it builds rows on
-the fly, ingests into a live store, issues concurrent queries during ingestion,
-then runs one final exact verification pass after the stream completes.
+The Rust `bench` binary and the Go benchmark now use the same **store-only**
+workload:
+
+- build the full 1,000,000-row dataset eagerly in memory
+- build any queryable indexes required by that implementation
+- run the same 10,000-query verified mix
+- optionally repeat the query pass via `CHIRON_BENCH_QUERY_REPEATS`
+- use the shared-string query path for result materialization instead of forcing deep string copies on every hit
+
+Both benchmarks print the same high-level fields so their results are easier to
+compare side by side.
+
+The query mix in this benchmark is intentionally host-heavy:
+
+- 60% `ByHost`
+- 30% `ByServiceAndHost`
+- 10% `ByService`
+
+Use the store-only benchmark for query-path and data-structure performance work.
+
+Use the remaining ignored Kafka E2E tests for:
+
+- Kafka producer/consumer wiring
+- partition routing into the store
+- snapshot/restore round-trips
+- long-run correctness across the real Kafka integration path
+
+Those tests are useful for integration coverage, but the store-only benchmark is
+the right tool for judging small store-level optimizations.
 
 If no broker is reachable at `localhost:9092`, the E2E tests skip with a message instead of failing noisily.
 

@@ -2,23 +2,26 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"slices"
-	"strings"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
 // This benchmark keeps direct posting-list maps for service and host, then
-// intersects those posting lists for service+host queries. The streaming run
-// generates rows on one goroutine, ingests them into a shared store on another,
-// and issues live queries while ingestion is still in flight.
+// intersects those posting lists for service+host queries. The store-only run
+// builds the full dataset eagerly, then executes the exact verified query mix
+// used by the Rust benchmark binary.
 const (
 	serviceCount            = 100
 	hostCount               = 100
 	rowsPerPair             = 100
 	totalRows               = serviceCount * hostCount * rowsPerPair
 	queryCount              = 10_000
+	queryRepeatsDefault     = 5
+	queryPatternLen         = 20
 	liveQueryStartAfterRows = 50_000
 	entryBufferSize         = 8_192
 
@@ -54,6 +57,21 @@ type Store struct {
 	entries   []Entry
 	byService map[string][]int
 	byHost    map[string][]int
+}
+
+type QueryBreakdown struct {
+	Queries  int
+	Hits     int
+	Checksum uint64
+	Elapsed  time.Duration
+}
+
+type QueryStats struct {
+	TotalHits int
+	Checksum  uint64
+	Service   QueryBreakdown
+	Host      QueryBreakdown
+	Pair      QueryBreakdown
 }
 
 type SafeStore struct {
@@ -106,7 +124,8 @@ func (s *SafeStore) Len() int {
 func (s *SafeStore) RunVerifiedQueries(services, hosts []string) (int, uint64) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return runQueries(s.store, services, hosts)
+	stats := runQueriesDetailed(s.store, services, hosts)
+	return stats.TotalHits, stats.Checksum
 }
 
 func (s *Store) Ingest(entry Entry) {
@@ -129,12 +148,10 @@ func (s *Store) query(ids []int, t1, t2 int64) []Entry {
 }
 
 func cloneEntry(entry Entry) Entry {
-	return Entry{
-		Timestamp: entry.Timestamp,
-		Service:   strings.Clone(entry.Service),
-		Host:      strings.Clone(entry.Host),
-		Message:   strings.Clone(entry.Message),
-	}
+	// Go strings are immutable headers over shared backing bytes, so a plain
+	// struct copy mirrors Rust's Arc-backed hot-path comparison more closely
+	// than forcing a deep string clone here.
+	return entry
 }
 
 func sortEntries(entries []Entry) {
@@ -240,6 +257,11 @@ func consumeEntries(entries []Entry) uint64 {
 }
 
 func runQueries(store *Store, services, hosts []string) (int, uint64) {
+	stats := runQueriesDetailed(store, services, hosts)
+	return stats.TotalHits, stats.Checksum
+}
+
+func runQueriesDetailed(store *Store, services, hosts []string) QueryStats {
 	serviceFullHits := hostCount * rowsPerPair
 	serviceMidHits := hostCount * int(midRangeEnd-midRangeStart+1)
 	hostFullHits := serviceCount * rowsPerPair
@@ -247,77 +269,130 @@ func runQueries(store *Store, services, hosts []string) (int, uint64) {
 	pairFullHits := rowsPerPair
 	pairNarrowHits := int(narrowRangeEnd - narrowRangeStart + 1)
 
-	totalHits := 0
 	expectedTotalHits := 0
-	var checksum uint64
+	var stats QueryStats
 
 	for queryIdx := 0; queryIdx < queryCount; queryIdx++ {
-		switch queryIdx % 6 {
+		switch queryIdx % queryPatternLen {
 		case 0:
 			service := services[queryIdx%serviceCount]
+			started := time.Now()
 			result := store.QueryByService(service, fullRangeStart, fullRangeEnd)
+			elapsed := time.Since(started)
 			mustEqual("service full", len(result), serviceFullHits)
 			assertNondecreasingTimestamps(result)
-			totalHits += len(result)
 			expectedTotalHits += serviceFullHits
-			checksum += consumeEntries(result)
+			checksum := consumeEntries(result)
+			stats.TotalHits += len(result)
+			stats.Checksum += checksum
+			stats.Service = accumulateBreakdown(stats.Service, QueryBreakdown{
+				Queries:  1,
+				Hits:     len(result),
+				Checksum: checksum,
+				Elapsed:  elapsed,
+			})
 		case 1:
 			service := services[queryIdx%serviceCount]
+			started := time.Now()
 			result := store.QueryByService(service, midRangeStart, midRangeEnd)
+			elapsed := time.Since(started)
 			mustEqual("service mid", len(result), serviceMidHits)
 			assertNondecreasingTimestamps(result)
-			totalHits += len(result)
 			expectedTotalHits += serviceMidHits
-			checksum += consumeEntries(result)
-		case 2:
-			host := hosts[queryIdx%hostCount]
-			result := store.QueryByHost(host, fullRangeStart, fullRangeEnd)
-			mustEqual("host full", len(result), hostFullHits)
-			assertNondecreasingTimestamps(result)
-			totalHits += len(result)
-			expectedTotalHits += hostFullHits
-			checksum += consumeEntries(result)
-		case 3:
-			host := hosts[queryIdx%hostCount]
-			result := store.QueryByHost(host, midRangeStart, midRangeEnd)
-			mustEqual("host mid", len(result), hostMidHits)
-			assertNondecreasingTimestamps(result)
-			totalHits += len(result)
-			expectedTotalHits += hostMidHits
-			checksum += consumeEntries(result)
-		case 4:
+			checksum := consumeEntries(result)
+			stats.TotalHits += len(result)
+			stats.Checksum += checksum
+			stats.Service = accumulateBreakdown(stats.Service, QueryBreakdown{
+				Queries:  1,
+				Hits:     len(result),
+				Checksum: checksum,
+				Elapsed:  elapsed,
+			})
+		case 2, 4, 6:
 			serviceIdx := queryIdx % serviceCount
 			hostIdx := (queryIdx * 7) % hostCount
+			started := time.Now()
 			result := store.QueryByServiceAndHost(
 				services[serviceIdx],
 				hosts[hostIdx],
 				fullRangeStart,
 				fullRangeEnd,
 			)
+			elapsed := time.Since(started)
 			mustEqual("pair full", len(result), pairFullHits)
 			assertNondecreasingTimestamps(result)
-			totalHits += len(result)
 			expectedTotalHits += pairFullHits
-			checksum += consumeEntries(result)
-		default:
+			checksum := consumeEntries(result)
+			stats.TotalHits += len(result)
+			stats.Checksum += checksum
+			stats.Pair = accumulateBreakdown(stats.Pair, QueryBreakdown{
+				Queries:  1,
+				Hits:     len(result),
+				Checksum: checksum,
+				Elapsed:  elapsed,
+			})
+		case 3, 5, 7:
 			serviceIdx := queryIdx % serviceCount
 			hostIdx := (queryIdx * 7) % hostCount
+			started := time.Now()
 			result := store.QueryByServiceAndHost(
 				services[serviceIdx],
 				hosts[hostIdx],
 				narrowRangeStart,
 				narrowRangeEnd,
 			)
+			elapsed := time.Since(started)
 			mustEqual("pair narrow", len(result), pairNarrowHits)
 			assertNondecreasingTimestamps(result)
-			totalHits += len(result)
 			expectedTotalHits += pairNarrowHits
-			checksum += consumeEntries(result)
+			checksum := consumeEntries(result)
+			stats.TotalHits += len(result)
+			stats.Checksum += checksum
+			stats.Pair = accumulateBreakdown(stats.Pair, QueryBreakdown{
+				Queries:  1,
+				Hits:     len(result),
+				Checksum: checksum,
+				Elapsed:  elapsed,
+			})
+		case 8, 10, 12, 14, 16, 18:
+			host := hosts[queryIdx%hostCount]
+			started := time.Now()
+			result := store.QueryByHost(host, fullRangeStart, fullRangeEnd)
+			elapsed := time.Since(started)
+			mustEqual("host full", len(result), hostFullHits)
+			assertNondecreasingTimestamps(result)
+			expectedTotalHits += hostFullHits
+			checksum := consumeEntries(result)
+			stats.TotalHits += len(result)
+			stats.Checksum += checksum
+			stats.Host = accumulateBreakdown(stats.Host, QueryBreakdown{
+				Queries:  1,
+				Hits:     len(result),
+				Checksum: checksum,
+				Elapsed:  elapsed,
+			})
+		default:
+			host := hosts[queryIdx%hostCount]
+			started := time.Now()
+			result := store.QueryByHost(host, midRangeStart, midRangeEnd)
+			elapsed := time.Since(started)
+			mustEqual("host mid", len(result), hostMidHits)
+			assertNondecreasingTimestamps(result)
+			expectedTotalHits += hostMidHits
+			checksum := consumeEntries(result)
+			stats.TotalHits += len(result)
+			stats.Checksum += checksum
+			stats.Host = accumulateBreakdown(stats.Host, QueryBreakdown{
+				Queries:  1,
+				Hits:     len(result),
+				Checksum: checksum,
+				Elapsed:  elapsed,
+			})
 		}
 	}
 
-	mustEqual("total hits", totalHits, expectedTotalHits)
-	return totalHits, checksum
+	mustEqual("total hits", stats.TotalHits, expectedTotalHits)
+	return stats
 }
 
 func assertLiveQueryResult(entries []Entry, service string, checkService bool, host string, checkHost bool, t1, t2 int64, maxExpected int) (int, uint64) {
@@ -468,91 +543,96 @@ func runLiveQueries(store *SafeStore, services, hosts []string, ingested *atomic
 }
 
 func main() {
+	repeats := queryRepeatsDefault
+	if raw := os.Getenv("CHIRON_BENCH_QUERY_REPEATS"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			repeats = parsed
+		}
+	}
+
 	services, hosts := buildDimensions()
-	store := NewSafeStore(totalRows)
-	var ingested atomic.Uint64
-	var ingestDone atomic.Bool
-	entries := make(chan Entry, entryBufferSize)
+	store := NewStore(totalRows)
 
 	totalStart := time.Now()
+	buildStart := time.Now()
 
-	type durationResult struct {
-		elapsed time.Duration
-	}
-	type queryResult struct {
-		elapsed   time.Duration
-		totalHits int
-		checksum  uint64
-	}
-
-	generateResult := make(chan durationResult, 1)
-	ingestResult := make(chan durationResult, 1)
-	liveQueryResult := make(chan queryResult, 1)
-
-	go func() {
-		generateStart := time.Now()
-		for ts := 0; ts < rowsPerPair; ts++ {
-			for serviceIdx, service := range services {
-				for hostIdx, host := range hosts {
-					entries <- makeLoadEntry(serviceIdx, service, hostIdx, host, ts)
-				}
+	for ts := 0; ts < rowsPerPair; ts++ {
+		for serviceIdx, service := range services {
+			for hostIdx, host := range hosts {
+				store.Ingest(makeLoadEntry(serviceIdx, service, hostIdx, host, ts))
 			}
 		}
-		close(entries)
-		generateResult <- durationResult{elapsed: time.Since(generateStart)}
-	}()
-
-	go func() {
-		ingestStart := time.Now()
-		for entry := range entries {
-			store.Ingest(entry)
-			ingested.Add(1)
-		}
-		ingestDone.Store(true)
-		ingestResult <- durationResult{elapsed: time.Since(ingestStart)}
-	}()
-
-	go func() {
-		queryStart := time.Now()
-		totalHits, checksum := runLiveQueries(store, services, hosts, &ingested, &ingestDone)
-		liveQueryResult <- queryResult{
-			elapsed:   time.Since(queryStart),
-			totalHits: totalHits,
-			checksum:  checksum,
-		}
-	}()
-
-	generateElapsed := (<-generateResult).elapsed
-	ingestElapsed := (<-ingestResult).elapsed
-	liveQuery := <-liveQueryResult
-
-	totalElapsed := time.Since(totalStart)
-
-	if got := int(ingested.Load()); got != totalRows {
-		panic(fmt.Sprintf("ingested rows: got %d, want %d", got, totalRows))
 	}
-	if got := store.Len(); got != totalRows {
+	buildElapsed := time.Since(buildStart)
+
+	if got := len(store.entries); got != totalRows {
 		panic(fmt.Sprintf("store rows: got %d, want %d", got, totalRows))
 	}
 
-	verifyStart := time.Now()
-	totalHits, checksum := store.RunVerifiedQueries(services, hosts)
-	verifyElapsed := time.Since(verifyStart)
+	var indexElapsed time.Duration
+	queryStart := time.Now()
+	var stats QueryStats
+	for range repeats {
+		stats = accumulateStats(stats, runQueriesDetailed(store, services, hosts))
+	}
+	queryElapsed := time.Since(queryStart)
+	totalElapsed := time.Since(totalStart)
 
 	fmt.Printf(
-		"go_three_maps_streaming: rows=%d, live_queries=%d, build=%.3fs (%.0f rows/s), ingest=%.3fs (%.0f rows/s), live_query=%.3fs (%.0f q/s), total_streaming=%.3fs, final_verify=%.3fs, live_hits=%d, total_hits=%d\n",
+		"store_only_bench: impl=go store_shards=1 rows=%d, queries_per_pass=%d, repeats=%d, build=%.3fs, index=%.3fs, query=%.3fs, total=%.3fs, total_hits=%d, checksum=%d\n",
 		totalRows,
 		queryCount,
-		generateElapsed.Seconds(),
-		float64(totalRows)/generateElapsed.Seconds(),
-		ingestElapsed.Seconds(),
-		float64(totalRows)/ingestElapsed.Seconds(),
-		liveQuery.elapsed.Seconds(),
-		float64(queryCount)/liveQuery.elapsed.Seconds(),
+		repeats,
+		buildElapsed.Seconds(),
+		indexElapsed.Seconds(),
+		queryElapsed.Seconds(),
 		totalElapsed.Seconds(),
-		verifyElapsed.Seconds(),
-		liveQuery.totalHits,
-		totalHits,
+		stats.TotalHits,
+		stats.Checksum,
 	)
-	fmt.Printf("go_three_maps_checksum: live=%d final=%d\n", liveQuery.checksum, checksum)
+	printQueryBreakdown("go", stats)
+}
+
+func accumulateBreakdown(current, delta QueryBreakdown) QueryBreakdown {
+	current.Queries += delta.Queries
+	current.Hits += delta.Hits
+	current.Checksum += delta.Checksum
+	current.Elapsed += delta.Elapsed
+	return current
+}
+
+func accumulateStats(current, delta QueryStats) QueryStats {
+	current.TotalHits += delta.TotalHits
+	current.Checksum += delta.Checksum
+	current.Service = accumulateBreakdown(current.Service, delta.Service)
+	current.Host = accumulateBreakdown(current.Host, delta.Host)
+	current.Pair = accumulateBreakdown(current.Pair, delta.Pair)
+	return current
+}
+
+func printQueryBreakdown(implementation string, stats QueryStats) {
+	fmt.Printf(
+		"store_only_breakdown: impl=%s type=service queries=%d hits=%d checksum=%d time=%.3fs\n",
+		implementation,
+		stats.Service.Queries,
+		stats.Service.Hits,
+		stats.Service.Checksum,
+		stats.Service.Elapsed.Seconds(),
+	)
+	fmt.Printf(
+		"store_only_breakdown: impl=%s type=host queries=%d hits=%d checksum=%d time=%.3fs\n",
+		implementation,
+		stats.Host.Queries,
+		stats.Host.Hits,
+		stats.Host.Checksum,
+		stats.Host.Elapsed.Seconds(),
+	)
+	fmt.Printf(
+		"store_only_breakdown: impl=%s type=service_and_host queries=%d hits=%d checksum=%d time=%.3fs\n",
+		implementation,
+		stats.Pair.Queries,
+		stats.Pair.Hits,
+		stats.Pair.Checksum,
+		stats.Pair.Elapsed.Seconds(),
+	)
 }
