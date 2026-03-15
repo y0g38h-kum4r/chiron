@@ -185,7 +185,7 @@ fn kafka_full_lifecycle() {
     let total = all_entries.len(); // 3 × 3 × 10 = 90
 
     // Produce → Kafka → Consume → ChironStore.
-    let (mut store, consumed) = produce_and_consume(&topic, &group, &all_entries, 10_000).unwrap();
+    let (store, consumed) = produce_and_consume(&topic, &group, &all_entries, 10_000).unwrap();
 
     assert_eq!(
         consumed, total as u64,
@@ -250,7 +250,7 @@ fn kafka_time_range_filtering() {
         entries.push(entry(i * 100 + 50, "payment", "h0"));
     }
 
-    let (mut store, consumed) = produce_and_consume(&topic, &group, &entries, 1000).unwrap();
+    let (store, consumed) = produce_and_consume(&topic, &group, &entries, 1000).unwrap();
     assert_eq!(consumed, 10);
     store.flush_indexer();
 
@@ -297,7 +297,7 @@ fn kafka_eviction_purges_indexes() {
     // Produce 50 entries, but store capacity is only 20.
     let entries: Vec<LogEntry> = (0..50).map(|i| entry(i, "svc-a", "h0")).collect();
 
-    let (mut store, consumed) = produce_and_consume(&topic, &group, &entries, 20).unwrap();
+    let (store, consumed) = produce_and_consume(&topic, &group, &entries, 20).unwrap();
     assert_eq!(consumed, 50);
     // Ring buffer wrapped — only latest 20 survive in the buffer.
     assert_eq!(store.len(), 20);
@@ -344,7 +344,7 @@ fn kafka_snapshot_roundtrip() {
     }
     let total = entries.len(); // 2 × 3 × 20 = 120
 
-    let (mut store, consumed) = produce_and_consume(&topic, &group, &entries, 500).unwrap();
+    let (store, consumed) = produce_and_consume(&topic, &group, &entries, 500).unwrap();
     assert_eq!(consumed, total as u64);
     store.flush_indexer();
 
@@ -425,7 +425,7 @@ fn kafka_snapshot_after_eviction() {
         entries.push(entry(i, "beta", "h0"));
     }
 
-    let (mut store, consumed) = produce_and_consume(&topic, &group, &entries, 30).unwrap();
+    let (store, consumed) = produce_and_consume(&topic, &group, &entries, 30).unwrap();
     assert_eq!(consumed, 60);
 
     store.flush_indexer();
@@ -493,7 +493,7 @@ fn kafka_concurrent_producers() {
 
     // Consume all messages into ChironStore.
     let consumer = ChironConsumer::new(BROKERS, &topic, &group).unwrap();
-    let mut store = ChironStore::new(100_000);
+    let store = ChironStore::new(100_000);
     let mut consumed = 0u64;
 
     let poll_timeout = Duration::from_millis(500);
@@ -566,7 +566,7 @@ fn kafka_serialization_fidelity() {
         },
     ];
 
-    let (mut store, consumed) = produce_and_consume(&topic, &group, &entries, 100).unwrap();
+    let (store, consumed) = produce_and_consume(&topic, &group, &entries, 100).unwrap();
     assert_eq!(consumed, 4);
     store.flush_indexer();
 
@@ -710,7 +710,7 @@ fn kafka_sharded_store_roundtrip() {
         }
     }
 
-    let (mut store, consumed) =
+    let (store, consumed) =
         produce_and_consume_sharded(&topic, &group, &entries, 256, 4).unwrap();
     assert_eq!(consumed, entries.len() as u64);
     assert!(store.shard_count() >= 4);
@@ -793,7 +793,7 @@ fn kafka_sharded_eviction_keeps_newest_global_entries() {
         entries.push(entry(i, "svc", &host));
     }
 
-    let (mut store, consumed) =
+    let (store, consumed) =
         produce_and_consume_sharded(&topic, &group, &entries, 12, 4).unwrap();
     assert_eq!(consumed, 12);
 
