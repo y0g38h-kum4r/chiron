@@ -1,7 +1,9 @@
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::ffi::OsString;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::log_entry::LogEntry;
 
@@ -47,6 +49,7 @@ impl KafkaOffsets {
 
 const SHARDED_SNAPSHOT_MAGIC_V1: &[u8; 8] = b"CHIRON04";
 const SHARDED_SNAPSHOT_MAGIC_V2: &[u8; 8] = b"CHIRON05";
+static SNAPSHOT_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct SnapshotShard {
     pub shard_id: u32,
@@ -162,11 +165,14 @@ fn load_sharded_v2(cursor: &mut &[u8]) -> io::Result<(Vec<RestoredShard>, KafkaO
 // --- Binary encoding helpers ---
 
 fn durable_replace(path: &Path, buf: &[u8]) -> io::Result<()> {
-    let tmp_path = path.with_extension("tmp");
+    let tmp_path = unique_tmp_path(path);
 
     // Write the temp file durably before rename so power loss does not
     // leave us with a renamed but not-yet-persisted snapshot payload.
-    let mut tmp_file = File::create(&tmp_path)?;
+    let mut tmp_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)?;
     tmp_file.write_all(buf)?;
     tmp_file.sync_all()?;
     drop(tmp_file);
@@ -175,6 +181,15 @@ fn durable_replace(path: &Path, buf: &[u8]) -> io::Result<()> {
     sync_parent_dir(path)?;
 
     Ok(())
+}
+
+fn unique_tmp_path(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path.file_name().unwrap_or_else(|| "snapshot".as_ref());
+    let mut tmp_name = OsString::from(file_name);
+    let seq = SNAPSHOT_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    tmp_name.push(format!(".tmp.{}.{}", std::process::id(), seq));
+    parent.join(tmp_name)
 }
 
 fn write_u64(buf: &mut Vec<u8>, val: u64) {
@@ -272,6 +287,9 @@ fn split_total_capacity(total_capacity: usize, shard_count: usize) -> Vec<usize>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn make_entry(ts: i64, svc: &str, host: &str) -> LogEntry {
         LogEntry {
@@ -282,9 +300,33 @@ mod tests {
         }
     }
 
+    fn unique_test_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{nanos}"))
+    }
+
+    fn make_snapshot_variant(seed: i64, offset: u64) -> (Vec<SnapshotShard>, KafkaOffsets) {
+        let shards = vec![SnapshotShard {
+            shard_id: 0,
+            capacity: 8,
+            next_offset: 2,
+            entries: vec![
+                make_entry(seed, "auth", "h0"),
+                make_entry(seed + 1, "auth", "h0"),
+            ],
+        }];
+
+        let mut offsets = KafkaOffsets::new();
+        offsets.set("logs", 0, offset);
+        (shards, offsets)
+    }
+
     #[test]
     fn sharded_snapshot_roundtrip() {
-        let dir = std::env::temp_dir().join("chiron_test_sharded_snapshot");
+        let dir = unique_test_dir("chiron_test_sharded_snapshot");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("sharded.snap");
 
@@ -333,6 +375,57 @@ mod tests {
         assert_eq!(offsets_loaded.get("logs", 0), Some(45230));
         assert_eq!(offsets_loaded.get("logs", 1), Some(38901));
         assert_eq!(offsets_loaded.get("logs", 2), None);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn concurrent_saves_to_same_path_remain_loadable() {
+        let dir = unique_test_dir("chiron_test_concurrent_snapshot");
+        fs::create_dir_all(&dir).unwrap();
+        let path = Arc::new(dir.join("shared.snap"));
+        let start = Arc::new(Barrier::new(3));
+
+        let path_a = Arc::clone(&path);
+        let start_a = Arc::clone(&start);
+        let writer_a = thread::spawn(move || -> io::Result<()> {
+            start_a.wait();
+            for _ in 0..50 {
+                let (shards, offsets) = make_snapshot_variant(10, 100);
+                Snapshot::save_sharded(path_a.as_ref(), &shards, &offsets)?;
+            }
+            Ok(())
+        });
+
+        let path_b = Arc::clone(&path);
+        let start_b = Arc::clone(&start);
+        let writer_b = thread::spawn(move || -> io::Result<()> {
+            start_b.wait();
+            for _ in 0..50 {
+                let (shards, offsets) = make_snapshot_variant(20, 200);
+                Snapshot::save_sharded(path_b.as_ref(), &shards, &offsets)?;
+            }
+            Ok(())
+        });
+
+        start.wait();
+        writer_a.join().unwrap().unwrap();
+        writer_b.join().unwrap().unwrap();
+
+        let (restored, offsets) = Snapshot::load_sharded(path.as_ref()).unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].entries.len(), 2);
+
+        let first_timestamp = restored[0].entries[0].timestamp;
+        assert!(
+            matches!(first_timestamp, 10 | 20),
+            "final snapshot should contain one complete writer payload"
+        );
+        match first_timestamp {
+            10 => assert_eq!(offsets.get("logs", 0), Some(100)),
+            20 => assert_eq!(offsets.get("logs", 0), Some(200)),
+            _ => unreachable!(),
+        }
 
         fs::remove_dir_all(&dir).ok();
     }
