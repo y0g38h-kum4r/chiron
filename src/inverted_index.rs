@@ -9,11 +9,17 @@ pub struct InvertedIndex {
     index: HashMap<String, Vec<u64>>,
 }
 
-impl InvertedIndex {
-    pub fn new() -> Self {
+impl Default for InvertedIndex {
+    fn default() -> Self {
         Self {
             index: HashMap::new(),
         }
+    }
+}
+
+impl InvertedIndex {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Record that `global_offset` contains an entry with the given dimension `key`.

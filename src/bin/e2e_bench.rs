@@ -27,25 +27,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use chiron::chiron::ChironStore;
 use chiron::kafka::{ChironConsumer, ChironKafkaError, ChironProducer, ensure_topic};
 use chiron::log_entry::LogEntry;
+use chiron::{env_string, env_u64, env_usize, ingest_batch_by_partition};
 use rdkafka::error::KafkaError;
-
-fn env_str(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
-}
-
-fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
-}
-
-fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
-}
 
 fn kafka_available(brokers: &str) -> bool {
     match brokers.to_socket_addrs() {
@@ -85,8 +68,8 @@ fn should_retry_consumer_error(err: &ChironKafkaError) -> bool {
 }
 
 fn main() {
-    let brokers = env_str("CHIRON_BROKERS", "localhost:9092");
-    let topic_prefix = env_str("CHIRON_TOPIC", "chiron-e2e-bench");
+    let brokers = env_string("CHIRON_BROKERS", "localhost:9092");
+    let topic_prefix = env_string("CHIRON_TOPIC", "chiron-e2e-bench");
     let service_count = env_usize("CHIRON_SERVICES", 10);
     let host_count = env_usize("CHIRON_HOSTS", 10);
     let num_partitions = env_usize("CHIRON_PARTITIONS", 4);
@@ -357,25 +340,3 @@ fn main() {
     println!("e2e_bench: consumer_errors={consumer_errors}");
 }
 
-fn ingest_batch_by_partition(store: &ChironStore, batch: &mut Vec<(LogEntry, u32)>) {
-    if batch.is_empty() {
-        return;
-    }
-
-    batch.sort_unstable_by_key(|(_, partition)| *partition);
-
-    let mut current_partition = batch[0].1;
-    let mut partition_entries = Vec::new();
-
-    for (entry, partition) in batch.drain(..) {
-        if partition != current_partition && !partition_entries.is_empty() {
-            store.ingest_partition_batch(current_partition, std::mem::take(&mut partition_entries));
-            current_partition = partition;
-        }
-        partition_entries.push(entry);
-    }
-
-    if !partition_entries.is_empty() {
-        store.ingest_partition_batch(current_partition, partition_entries);
-    }
-}

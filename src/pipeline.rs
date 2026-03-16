@@ -1,12 +1,12 @@
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-use std::{env, fmt::Display};
 
 use crate::chiron::ChironStore;
 use crate::kafka::{ChironConsumer, ChironKafkaError};
 use crate::log_entry::LogEntry;
 use crate::snapshot::KafkaOffsets;
+use crate::{env_string, env_u32, env_u64, env_usize, ingest_batch_by_partition};
 
 /// Configuration for the Kafka -> Chiron ingest pipeline.
 pub struct PipelineConfig {
@@ -45,42 +45,6 @@ impl PipelineConfig {
                 env_u64("CHIRON_CONSUMER_IDLE_MS", 5_000).max(1),
             ),
         }
-    }
-}
-
-fn env_string(name: &str, default: &str) -> String {
-    env::var(name).unwrap_or_else(|_| default.to_string())
-}
-
-fn env_u32(name: &str, default: u32) -> u32 {
-    env_parsed(name).unwrap_or(default)
-}
-
-fn env_usize(name: &str, default: usize) -> usize {
-    env_parsed(name).unwrap_or(default)
-}
-
-fn env_u64(name: &str, default: u64) -> u64 {
-    env_parsed(name).unwrap_or(default)
-}
-
-fn env_parsed<T>(name: &str) -> Option<T>
-where
-    T: std::str::FromStr,
-    T::Err: Display,
-{
-    match env::var(name) {
-        Ok(raw) => match raw.parse::<T>() {
-            Ok(value) => Some(value),
-            Err(err) => {
-                eprintln!(
-                    "invalid value for {}: {:?} ({}) - falling back to default",
-                    name, raw, err
-                );
-                None
-            }
-        },
-        Err(_) => None,
     }
 }
 
@@ -216,25 +180,3 @@ fn join_thread_result<T>(
         .map_err(|_| ChironKafkaError::ThreadPanic("worker thread panicked"))?
 }
 
-fn ingest_batch_by_partition(store: &ChironStore, batch: &mut Vec<(LogEntry, u32)>) {
-    if batch.is_empty() {
-        return;
-    }
-
-    batch.sort_unstable_by_key(|(_, partition)| *partition);
-
-    let mut current_partition = batch[0].1;
-    let mut partition_entries = Vec::new();
-
-    for (entry, partition) in batch.drain(..) {
-        if partition != current_partition && !partition_entries.is_empty() {
-            store.ingest_partition_batch(current_partition, std::mem::take(&mut partition_entries));
-            current_partition = partition;
-        }
-        partition_entries.push(entry);
-    }
-
-    if !partition_entries.is_empty() {
-        store.ingest_partition_batch(current_partition, partition_entries);
-    }
-}

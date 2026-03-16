@@ -401,6 +401,10 @@ impl ChironStore {
         self.live_len.load(Ordering::Acquire)
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn capacity(&self) -> usize {
         self.total_capacity
     }

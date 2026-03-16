@@ -1,4 +1,4 @@
-//! True end-to-end integration tests for ChironVision Log Buffer.
+//! True end-to-end integration tests for Chiron Log Buffer.
 //!
 //! Full path: LogEntry → Kafka produce → Kafka consume → ChironStore ingest
 //!            → query → snapshot → restore

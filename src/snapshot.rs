@@ -13,11 +13,17 @@ pub struct KafkaOffsets {
     pub offsets: HashMap<String, HashMap<u32, u64>>,
 }
 
-impl KafkaOffsets {
-    pub fn new() -> Self {
+impl Default for KafkaOffsets {
+    fn default() -> Self {
         Self {
             offsets: HashMap::new(),
         }
+    }
+}
+
+impl KafkaOffsets {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn set(&mut self, topic: &str, partition: u32, offset: u64) {
