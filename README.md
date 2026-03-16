@@ -34,6 +34,16 @@ The store is shard-aware end-to-end now, but a few control-plane pieces are stil
 
 So the hot data path is shard-local, while a small amount of lifecycle and capacity coordination still lives at the store level.
 
+### TODO: Stable Host→Partition Assignment
+
+The current `partition_for_host(host_id, num_partitions)` mapping is a static hash (`hash(host_id) % num_partitions`). This means any change to `num_partitions` (e.g. scaling from 4 to 8 partitions) rehashes every host, causing a full reshuffle of which shard owns which host. That triggers:
+
+- mass eviction as hosts land in new shards
+- temporary query misses while data rebuilds in the new shard
+- wasted Kafka replay if snapshots become invalid after a partition count change
+
+This needs to be improved with a stable assignment strategy (e.g. consistent hashing or a persisted routing table) so that scaling the partition count only migrates a minimal subset of hosts instead of rebalancing everything.
+
 ## Write Path
 
 ```text
