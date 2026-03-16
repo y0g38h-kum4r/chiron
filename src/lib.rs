@@ -61,8 +61,8 @@ where
     }
 }
 
-/// Sort a batch of entries by partition, then ingest each partition's entries
-/// into the corresponding shard in a single batch call.
+/// Sort a batch of entries by partition, preserving the original order within
+/// each partition, then ingest each partition's entries in a single batch call.
 pub fn ingest_batch_by_partition(store: &ChironStore, batch: &mut Vec<(LogEntry, u32)>) {
     if batch.is_empty() {
         return;

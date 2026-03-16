@@ -56,8 +56,8 @@ pub struct PipelineStats {
     pub kafka_offsets: KafkaOffsets,
 }
 
-/// Start the Kafka -> store ingest pipeline and drain until the consumer group
-/// has been idle for `consumer_idle_timeout`.
+/// Start the Kafka -> store ingest pipeline and drain until every consumer
+/// thread has observed no messages for `consumer_idle_timeout`.
 pub fn run_pipeline(
     config: PipelineConfig,
 ) -> Result<(Arc<ChironStore>, PipelineStats), ChironKafkaError> {

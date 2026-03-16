@@ -166,7 +166,9 @@ Recovery does the following:
 
 ### Snapshot Consistency
 
-`save_snapshot` clones each shard under its own per-shard read lock, so individual shards are internally consistent (no torn `next_offset` / entries). No global ingest pause is required — Kafka offsets provide the consistency boundary on restore, and any entries ingested between shard captures are simply replayed from those offsets.
+`save_snapshot` clones each shard under its own per-shard read lock, so individual shards are internally consistent (no torn `next_offset` / entries).
+
+If you take a snapshot while ingest is still active, you must coordinate the supplied Kafka offsets with the snapshot point yourself. The current API does not create one global cut across every shard plus the offset map, so mismatched offsets can replay duplicates or skip records on restore.
 
 ## File Structure
 

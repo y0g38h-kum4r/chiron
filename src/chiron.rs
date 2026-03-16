@@ -440,8 +440,11 @@ impl ChironStore {
     }
 
     /// Save a snapshot. Each shard is cloned under its own read lock, so
-    /// individual shards are self-consistent. No global ingest pause is
-    /// required — Kafka offsets provide the consistency boundary on restore.
+    /// individual shards are self-consistent.
+    ///
+    /// If callers snapshot while ingest is still active, they must coordinate
+    /// the supplied Kafka offsets with the snapshot point themselves. This API
+    /// does not establish a global cut across shards and offsets.
     pub fn save_snapshot(&self, path: &Path, kafka_offsets: &KafkaOffsets) -> io::Result<()> {
         let shards: Vec<_> = self
             .shards
