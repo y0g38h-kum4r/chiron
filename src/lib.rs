@@ -68,7 +68,7 @@ pub fn ingest_batch_by_partition(store: &ChironStore, batch: &mut Vec<(LogEntry,
         return;
     }
 
-    batch.sort_unstable_by_key(|(_, partition)| *partition);
+    batch.sort_by_key(|(_, partition)| *partition);
 
     let mut current_partition = batch[0].1;
     let mut partition_entries = Vec::new();

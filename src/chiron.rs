@@ -337,7 +337,10 @@ impl ChironStore {
     }
 
     /// Append directly into the shard that corresponds to a Kafka partition.
+    ///
+    /// Panics if the entry's `host_id` does not hash to `partition_id`.
     pub fn ingest_partition(&self, partition_id: u32, entry: LogEntry) -> u64 {
+        self.assert_host_belongs_to_partition(&entry.host_id, partition_id);
         let shard = self.shard_by_id(partition_id).unwrap_or_else(|| {
             panic!(
                 "partition id {partition_id} exceeds configured shard count {}",
@@ -348,9 +351,15 @@ impl ChironStore {
     }
 
     /// Append a batch directly into the shard that corresponds to a Kafka partition.
+    ///
+    /// Panics if any entry's `host_id` does not hash to `partition_id`.
     pub fn ingest_partition_batch(&self, partition_id: u32, entries: Vec<LogEntry>) -> usize {
         if entries.is_empty() {
             return 0;
+        }
+
+        for entry in &entries {
+            self.assert_host_belongs_to_partition(&entry.host_id, partition_id);
         }
 
         let shard = self.shard_by_id(partition_id).unwrap_or_else(|| {
@@ -452,7 +461,26 @@ impl ChironStore {
             ));
         }
 
-        let mut shards = Vec::with_capacity(restored_shards.len());
+        let shard_count = restored_shards.len();
+
+        // Validate the host→shard invariant before building the store.
+        for restored in &restored_shards {
+            for entry in &restored.entries {
+                let expected = partition_for_host(&entry.host_id, shard_count);
+                if expected != restored.shard_id as usize {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "snapshot invariant violation: host {:?} found in shard {} \
+                             but partition_for_host maps it to shard {}",
+                            entry.host_id, restored.shard_id, expected
+                        ),
+                    ));
+                }
+            }
+        }
+
+        let mut shards = Vec::with_capacity(shard_count);
         for restored in restored_shards {
             shards.push(Arc::new(PartitionShard::from_restored(restored)?));
         }
@@ -465,6 +493,14 @@ impl ChironStore {
         };
 
         Ok((store, kafka_offsets))
+    }
+
+    fn assert_host_belongs_to_partition(&self, host_id: &str, partition_id: u32) {
+        let expected = partition_for_host(host_id, self.shard_count()) as u32;
+        assert_eq!(
+            expected, partition_id,
+            "host {host_id:?} hashes to partition {expected} but was routed to partition {partition_id}"
+        );
     }
 
     /// Deterministic host→shard routing. Uses the shared `partition_for_host`
