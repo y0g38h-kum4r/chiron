@@ -188,11 +188,6 @@ src/
 
 ## Usage
 
-```bash
-cargo run
-cargo test
-```
-
 Kafka-backed end-to-end benchmark:
 
 ```bash
