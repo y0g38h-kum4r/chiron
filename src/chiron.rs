@@ -509,6 +509,11 @@ impl ChironStore {
                 continue;
             }
 
+            // TODO: Batch eviction — evict e.g. 1% of shard capacity at once
+            // instead of 1 entry at a time. Each evict_head triggers a full
+            // InvertedIndex::purge_below scan (O(K * log N) over all keys),
+            // so batching amortizes that cost and avoids latency spikes under
+            // high-cardinality dimensions (ephemeral hosts/services).
             let evicted = if target_shard.len() > 0 {
                 target_shard.evict_head(1)
             } else {
