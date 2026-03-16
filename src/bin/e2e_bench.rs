@@ -25,7 +25,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chiron::chiron::ChironStore;
-use chiron::kafka::{ensure_topic, ChironConsumer, ChironKafkaError, ChironProducer};
+use chiron::kafka::{ChironConsumer, ChironKafkaError, ChironProducer, ensure_topic};
 use chiron::log_entry::LogEntry;
 use rdkafka::error::KafkaError;
 
@@ -275,8 +275,7 @@ fn main() {
                     6..=8 => {
                         let svc = &services[q % service_count];
                         let host = &hosts[(q * 3) % host_count];
-                        let result =
-                            store.query_by_service_and_host(svc, host, i64::MIN, i64::MAX);
+                        let result = store.query_by_service_and_host(svc, host, i64::MIN, i64::MAX);
                         local_by_svc_host += 1;
                         black_box(result.entries.len())
                     }

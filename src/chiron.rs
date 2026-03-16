@@ -33,7 +33,6 @@ struct PartitionShard {
 
 struct PartitionShardState {
     buffer: PartitionBuffer,
-    indexer_pos: u64,
     service_index: InvertedIndex,
     host_index: InvertedIndex,
 }
@@ -115,32 +114,33 @@ impl PartitionBuffer {
 }
 
 impl PartitionShardState {
+    fn new(buffer: PartitionBuffer) -> Self {
+        let mut state = Self {
+            buffer,
+            service_index: InvertedIndex::new(),
+            host_index: InvertedIndex::new(),
+        };
+        state.rebuild_indexes();
+        state
+    }
+
+    fn rebuild_indexes(&mut self) {
+        self.service_index = InvertedIndex::new();
+        self.host_index = InvertedIndex::new();
+
+        for (idx, entry) in self.buffer.entries.iter().enumerate() {
+            let offset = self.buffer.oldest_offset + idx as u64;
+            self.service_index.insert(&entry.service_name, offset);
+            self.host_index.insert(&entry.host_id, offset);
+        }
+    }
+
     fn ingest(&mut self, entry: SharedLogEntry) -> u64 {
-        let offset = self.buffer.push(entry);
-        // Index inline while we already hold the write lock — avoids
-        // accumulating indexer lag between background flush ticks.
-        if let Some(e) = self.buffer.get(offset) {
-            self.service_index.insert(&e.service_name, offset);
-            self.host_index.insert(&e.host_id, offset);
-        }
-        self.indexer_pos = self.buffer.next_offset();
+        let offset = self.buffer.next_offset();
+        self.service_index.insert(&entry.service_name, offset);
+        self.host_index.insert(&entry.host_id, offset);
+        self.buffer.push(entry);
         offset
-    }
-
-    fn flush_indexer(&mut self) {
-        let write_head = self.buffer.next_offset();
-        while self.indexer_pos < write_head {
-            if let Some(entry) = self.buffer.get(self.indexer_pos) {
-                self.service_index
-                    .insert(&entry.service_name, self.indexer_pos);
-                self.host_index.insert(&entry.host_id, self.indexer_pos);
-            }
-            self.indexer_pos += 1;
-        }
-    }
-
-    fn indexer_lag(&self) -> u64 {
-        self.buffer.next_offset() - self.indexer_pos
     }
 
     fn query_by_service(&self, service: &str, t1: i64, t2: i64) -> Vec<SharedLogEntry> {
@@ -174,10 +174,11 @@ impl PartitionShardState {
                 Ordering::Less => i += 1,
                 Ordering::Greater => j += 1,
                 Ordering::Equal => {
-                    if let Some(entry) = self.buffer.get(service_offsets[i]) {
-                        if entry.timestamp >= t1 && entry.timestamp <= t2 {
-                            entries.push(entry.clone());
-                        }
+                    if let Some(entry) = self.buffer.get(service_offsets[i])
+                        && entry.timestamp >= t1
+                        && entry.timestamp <= t2
+                    {
+                        entries.push(entry.clone());
                     }
                     i += 1;
                     j += 1;
@@ -188,12 +189,7 @@ impl PartitionShardState {
         entries
     }
 
-    fn collect_entries(
-        &self,
-        offsets: Option<&[u64]>,
-        t1: i64,
-        t2: i64,
-    ) -> Vec<SharedLogEntry> {
+    fn collect_entries(&self, offsets: Option<&[u64]>, t1: i64, t2: i64) -> Vec<SharedLogEntry> {
         match offsets {
             None => vec![],
             Some(offsets) => offsets
@@ -230,12 +226,7 @@ impl PartitionShard {
         Self {
             shard_id,
             capacity,
-            inner: RwLock::new(PartitionShardState {
-                buffer: PartitionBuffer::new(),
-                indexer_pos: 0,
-                service_index: InvertedIndex::new(),
-                host_index: InvertedIndex::new(),
-            }),
+            inner: RwLock::new(PartitionShardState::new(PartitionBuffer::new())),
         }
     }
 
@@ -243,12 +234,10 @@ impl PartitionShard {
         Ok(Self {
             shard_id: restored.shard_id,
             capacity: restored.capacity,
-            inner: RwLock::new(PartitionShardState {
-                buffer: PartitionBuffer::from_snapshot(restored.next_offset, restored.entries)?,
-                indexer_pos: 0,
-                service_index: InvertedIndex::new(),
-                host_index: InvertedIndex::new(),
-            }),
+            inner: RwLock::new(PartitionShardState::new(PartitionBuffer::from_snapshot(
+                restored.next_offset,
+                restored.entries,
+            )?)),
         })
     }
 
@@ -268,14 +257,6 @@ impl PartitionShard {
         }
 
         len
-    }
-
-    fn flush_indexer(&self) {
-        self.inner.write().unwrap().flush_indexer();
-    }
-
-    fn indexer_lag(&self) -> u64 {
-        self.inner.read().unwrap().indexer_lag()
     }
 
     fn query_by_service(&self, service: &str, t1: i64, t2: i64) -> Vec<SharedLogEntry> {
@@ -314,7 +295,6 @@ impl PartitionShard {
     fn entries_owned(&self) -> Vec<LogEntry> {
         self.inner.read().unwrap().buffer.entries_owned()
     }
-
 }
 
 impl ChironStore {
@@ -376,23 +356,16 @@ impl ChironStore {
         shard.ingest_batch(shared_entries)
     }
 
-    pub fn flush_indexer(&self) {
-        for shard in self.shard_handles() {
-            shard.flush_indexer();
-        }
-    }
+    /// Compatibility no-op: entries are indexed during ingest and restored
+    /// snapshots rebuild their indexes eagerly while loading.
+    pub fn flush_indexer(&self) {}
 
-    pub fn flush_indexer_shard(&self, shard_id: u32) {
-        if let Some(shard) = self.shard_by_id(shard_id) {
-            shard.flush_indexer();
-        }
-    }
+    /// Compatibility no-op kept for callers that still issue shard-local flushes.
+    pub fn flush_indexer_shard(&self, _shard_id: u32) {}
 
+    /// Inline indexing means there is no deferred indexing backlog to report.
     pub fn indexer_lag(&self) -> u64 {
-        self.shard_handles()
-            .iter()
-            .map(|shard| shard.indexer_lag())
-            .sum()
+        0
     }
 
     pub fn query_by_service(&self, service: &str, t1: i64, t2: i64) -> QueryResult {
@@ -480,7 +453,6 @@ impl ChironStore {
             shard_admin: Mutex::new(()),
             capacity_admin: Mutex::new(()),
         };
-        store.flush_indexer();
 
         Ok((store, kafka_offsets))
     }
@@ -633,12 +605,6 @@ mod tests {
         assert_eq!(result.entries.len(), 2);
         assert!(result.entries.iter().all(|e| &*e.service_name == "auth"));
         assert_nondecreasing_timestamps(&result.entries);
-
-        // flush_indexer is still safe to call (idempotent).
-        store.flush_indexer();
-
-        let result = store.query_by_service("auth", 0, 100);
-        assert_eq!(result.entries.len(), 2);
     }
 
     #[test]
@@ -647,7 +613,6 @@ mod tests {
         store.ingest(make_entry(10, "auth", "h1"));
         store.ingest(make_entry(20, "auth", "h2"));
         store.ingest(make_entry(30, "payment", "h1"));
-        store.flush_indexer();
 
         let result = store.query_by_host("h1", 0, 100);
         assert_eq!(result.entries.len(), 2);
@@ -661,7 +626,6 @@ mod tests {
         store.ingest(make_entry(10, "auth", "h1"));
         store.ingest(make_entry(20, "auth", "h2"));
         store.ingest(make_entry(30, "payment", "h1"));
-        store.flush_indexer();
 
         let result = store.query_by_service_and_host("auth", "h1", 0, 100);
         assert_eq!(result.entries.len(), 1);
@@ -675,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn shard_local_flush_only_indexes_that_shard() {
+    fn shard_local_queries_work_without_flush() {
         let store = ChironStore::with_shards(12, 2);
         let p0 = part("host-0", 2);
         let p1 = part("host-1", 2);
@@ -700,15 +664,10 @@ mod tests {
         let p = part("h1", 2);
         let ingested = store.ingest_partition_batch(
             p,
-            vec![
-                make_entry(10, "auth", "h1"),
-                make_entry(20, "auth", "h1"),
-            ],
+            vec![make_entry(10, "auth", "h1"), make_entry(20, "auth", "h1")],
         );
         assert_eq!(ingested, 2);
         assert_eq!(store.len(), 2);
-
-        store.flush_indexer_shard(p);
 
         let host = store.query_by_host("h1", 0, 100);
         assert_eq!(host.entries.len(), 2);
@@ -725,7 +684,6 @@ mod tests {
         for ts in [5, 10, 15, 20, 25] {
             store.ingest(make_entry(ts, "svc", "h1"));
         }
-        store.flush_indexer();
 
         let result = store.query_by_service("svc", 10, 20);
         assert_eq!(result.entries.len(), 3);
@@ -733,33 +691,34 @@ mod tests {
     }
 
     #[test]
-    fn indexer_lag_tracks_unindexed() {
+    fn indexer_lag_stays_zero() {
         let store = ChironStore::new(1000);
         assert_eq!(store.indexer_lag(), 0);
         assert_eq!(store.len(), 0);
 
         store.ingest(make_entry(1, "a", "h1"));
         store.ingest(make_entry(2, "b", "h1"));
-        // Inline indexing keeps lag at zero.
         assert_eq!(store.indexer_lag(), 0);
         assert_eq!(store.len(), 2);
-
-        store.flush_indexer();
-        assert_eq!(store.indexer_lag(), 0);
     }
 
     #[test]
-    fn flush_indexer_makes_entries_queryable() {
+    fn flush_indexer_is_a_compatibility_noop() {
         let store = ChironStore::new(1000);
         for ts in 0..100 {
             store.ingest(make_entry(ts, "svc", "h1"));
         }
+
+        let before = store.query_by_service("svc", 0, 100);
+        assert_eq!(before.entries.len(), 100);
+
         store.flush_indexer();
+        store.flush_indexer_shard(part("h1", 1));
         assert_eq!(store.indexer_lag(), 0);
 
-        let result = store.query_by_service("svc", 0, 100);
-        assert_eq!(result.entries.len(), 100);
-        assert_nondecreasing_timestamps(&result.entries);
+        let after = store.query_by_service("svc", 0, 100);
+        assert_eq!(after.entries.len(), 100);
+        assert_nondecreasing_timestamps(&after.entries);
     }
 
     #[test]
@@ -772,7 +731,6 @@ mod tests {
         store.ingest(make_entry(20, "auth", "h1"));
         store.ingest(make_entry(30, "payments", "h2"));
         store.ingest(make_entry(40, "auth", "h1"));
-        store.flush_indexer();
 
         let host_result = store.query_by_host("h1", 0, 100);
         assert_eq!(host_result.entries.len(), 2);
@@ -801,7 +759,6 @@ mod tests {
         assert_eq!(store.len(), 4);
         store.ingest_partition(p0, make_entry(50, "svc", "h0"));
         assert_eq!(store.len(), 4);
-        store.flush_indexer();
 
         let result = store.query_by_service("svc", 0, 100);
         assert_eq!(result.entries.len(), 4);
@@ -823,7 +780,6 @@ mod tests {
         // 13th entry forces eviction from the writing shard.
         store.ingest_partition(p, make_entry(12, "svc", "hot-host"));
         assert_eq!(store.len(), 12);
-        store.flush_indexer();
 
         let result = store.query_by_service("svc", 0, i64::MAX);
         assert_eq!(result.entries.len(), 12);
@@ -839,7 +795,6 @@ mod tests {
         store.ingest(make_entry(10, "svc", "h1"));
         store.ingest(make_entry(10, "svc", "h2"));
         store.ingest(make_entry(11, "svc", "h3"));
-        store.flush_indexer();
 
         let result = store.query_by_service("svc", 0, i64::MAX);
         assert_eq!(result.entries.len(), 3);
@@ -866,7 +821,6 @@ mod tests {
         store.ingest(make_entry(10, "auth", "h1"));
         store.ingest(make_entry(20, "payment", "h2"));
         store.ingest(make_entry(30, "auth", "h1"));
-        store.flush_indexer();
 
         let mut offsets = KafkaOffsets::new();
         offsets.set("logs", 0, 99999);

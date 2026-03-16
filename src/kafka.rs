@@ -89,7 +89,11 @@ pub struct ChironProducer {
 }
 
 impl ChironProducer {
-    pub fn new(brokers: &str, topic: &str, num_partitions: usize) -> Result<Self, ChironKafkaError> {
+    pub fn new(
+        brokers: &str,
+        topic: &str,
+        num_partitions: usize,
+    ) -> Result<Self, ChironKafkaError> {
         let producer: BaseProducer = ClientConfig::new()
             .set("bootstrap.servers", brokers)
             .set("message.timeout.ms", "5000")

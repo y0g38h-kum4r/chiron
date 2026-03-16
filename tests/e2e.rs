@@ -1,7 +1,7 @@
 //! True end-to-end integration tests for ChironVision Log Buffer.
 //!
 //! Full path: LogEntry → Kafka produce → Kafka consume → ChironStore ingest
-//!            → flush indexer → query → snapshot → restore
+//!            → query → snapshot → restore
 //!
 //! Requires a running Kafka broker (docker compose up -d).
 //! Run with:  cargo test --test e2e -- --ignored
@@ -192,9 +192,6 @@ fn kafka_full_lifecycle() {
         "all entries should be consumed from Kafka"
     );
 
-    // Ingest indexes entries inline, so flushing is a no-op here,
-    // but call it for symmetry and to assert zero lag.
-    store.flush_indexer();
     assert_eq!(store.indexer_lag(), 0);
 
     // Query by service: "auth" → 3 hosts × 10 = 30.
@@ -245,7 +242,6 @@ fn kafka_time_range_filtering() {
 
     let (store, consumed) = produce_and_consume(&topic, &group, &entries, 1000).unwrap();
     assert_eq!(consumed, 10);
-    store.flush_indexer();
 
     // auth in [200, 400] → 200, 300, 400.
     let result = store.query_by_service("auth", 200, 400);
@@ -295,8 +291,6 @@ fn kafka_eviction_purges_indexes() {
     // Ring buffer wrapped — only latest 20 survive in the buffer.
     assert_eq!(store.len(), 20);
 
-    store.flush_indexer();
-
     // All 20 entries survive (eviction only happens on ingest pressure now).
     let remaining = store.len();
     assert_eq!(remaining, 20);
@@ -339,7 +333,6 @@ fn kafka_snapshot_roundtrip() {
 
     let (store, consumed) = produce_and_consume(&topic, &group, &entries, 500).unwrap();
     assert_eq!(consumed, total as u64);
-    store.flush_indexer();
 
     // Record pre-snapshot query results.
     let pre_auth = store.query_by_service("auth", 0, i64::MAX).entries.len();
@@ -421,7 +414,6 @@ fn kafka_snapshot_after_eviction() {
     let (store, consumed) = produce_and_consume(&topic, &group, &entries, 30).unwrap();
     assert_eq!(consumed, 60);
 
-    store.flush_indexer();
     let surviving = store.len();
     assert!(surviving > 0 && surviving <= 30);
 
@@ -512,8 +504,6 @@ fn kafka_concurrent_producers() {
 
     assert_eq!(consumed, total_expected, "all entries consumed from Kafka");
 
-    store.flush_indexer();
-
     // svc-0 from threads 0, 2 → 2 × 50 = 100.
     let result = store.query_by_service("svc-0", 0, i64::MAX);
     assert_eq!(result.entries.len(), 100);
@@ -561,7 +551,6 @@ fn kafka_serialization_fidelity() {
 
     let (store, consumed) = produce_and_consume(&topic, &group, &entries, 100).unwrap();
     assert_eq!(consumed, 4);
-    store.flush_indexer();
 
     // Verify each entry survived Kafka JSON serialization/deserialization intact.
     let r = store.query_by_service("svc-with-dashes", 0, 0);
@@ -703,12 +692,10 @@ fn kafka_sharded_store_roundtrip() {
         }
     }
 
-    let (store, consumed) =
-        produce_and_consume_sharded(&topic, &group, &entries, 256, 4).unwrap();
+    let (store, consumed) = produce_and_consume_sharded(&topic, &group, &entries, 256, 4).unwrap();
     assert_eq!(consumed, entries.len() as u64);
     assert!(store.shard_count() >= 4);
 
-    store.flush_indexer();
     assert_eq!(store.indexer_lag(), 0);
 
     let auth = store.query_by_service("auth", 0, i64::MAX);
@@ -786,11 +773,9 @@ fn kafka_sharded_eviction_keeps_newest_global_entries() {
         entries.push(entry(i, "svc", &host));
     }
 
-    let (store, consumed) =
-        produce_and_consume_sharded(&topic, &group, &entries, 12, 4).unwrap();
+    let (store, consumed) = produce_and_consume_sharded(&topic, &group, &entries, 12, 4).unwrap();
     assert_eq!(consumed, 12);
 
-    store.flush_indexer();
     let result = store.query_by_service("svc", 0, i64::MAX);
 
     // No ingest pressure beyond capacity, so all 12 entries survive.

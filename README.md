@@ -16,7 +16,6 @@ The store is organized as **partition-local shards**. Each shard owns:
 - its own append buffer
 - its own service index
 - its own host index
-- its own indexer position
 - its own persisted capacity share for snapshot/restore
 
 In the Kafka pipeline, the store is created with one shard per Kafka partition. Consumed records are routed into the shard for the **actual Kafka partition returned by the broker**.
@@ -63,15 +62,13 @@ The intended invariant is strict: a given `host_id` must never appear in multipl
 
 Host-scoped queries do not need a mutable routing table anymore. They compute the owning shard directly with `partition_for_host(host_id, shard_count)`, so routing stays aligned with the producer-side Kafka partitioning rule.
 
-Each shard indexes accepted records inline while already holding its write lock, so the common ingest path does not accumulate index lag. The store still exposes `flush_indexer()` and `flush_indexer_shard(shard_id)`, but they are now mostly compatibility and recovery helpers.
-
-`e2e_bench` still carries a background indexer thread for benchmark instrumentation. The main pipeline path no longer depends on that loop.
+Each shard indexes accepted records inline while already holding its write lock, so the common ingest path does not accumulate index lag. The store still exposes `flush_indexer()` and `flush_indexer_shard(shard_id)` as compatibility no-ops, and `indexer_lag()` stays at zero because there is no deferred indexing backlog.
 
 ### Commit vs. Searchability
 
 In the Kafka pipeline, a consumer appends records into the in-memory shard buffer, indexes them inline, and only then commits the Kafka offset. The commit therefore means "accepted into the in-memory store and visible to queries on the live path."
 
-`flush_indexer()` still matters for restore flows because snapshots persist buffered entries, not materialized indexes. On the live ingest path, though, query freshness no longer depends on a background flush cadence.
+Snapshots persist buffered entries, not materialized indexes, so restore rebuilds shard-local indexes eagerly while loading the snapshot. Query freshness on the live ingest path does not depend on any background flush cadence.
 
 ## Read Path
 
@@ -154,7 +151,7 @@ The snapshot write path is durable:
 Recovery does the following:
 
 1. Load every shard from the snapshot file.
-2. Rebuild shard-local indexes by calling `flush_indexer()`.
+2. Rebuild shard-local indexes eagerly while loading those shards.
 3. Restore Kafka offsets from the snapshot.
 4. Resume consumers from those offsets and replay forward.
 
