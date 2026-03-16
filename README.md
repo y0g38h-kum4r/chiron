@@ -185,6 +185,10 @@ src/
 └── chiron.rs            # Shard-aware ChironStore
 ```
 
+## Benchmark Warm-Up
+
+`e2e_bench` waits for the consumer group to join before it starts measuring queries.
+
 ## Usage
 
 ```bash

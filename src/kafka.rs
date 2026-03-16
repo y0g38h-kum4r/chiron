@@ -1,11 +1,14 @@
 use std::time::Duration;
 
+use futures::executor::block_on;
+use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::error::KafkaError;
 use rdkafka::message::{BorrowedMessage, Message};
 use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
 use rdkafka::topic_partition_list::Offset;
+use rdkafka::types::RDKafkaErrorCode;
 
 use crate::log_entry::LogEntry;
 use crate::partition_for_host;
@@ -39,6 +42,41 @@ impl From<KafkaError> for ChironKafkaError {
     fn from(value: KafkaError) -> Self {
         Self::Kafka(value)
     }
+}
+
+/// Ensure a topic exists with the requested partition count.
+///
+/// This is primarily used by benchmarks/tests so they don't race Kafka's
+/// auto-topic-creation path and accidentally inherit the broker default
+/// partition count.
+pub fn ensure_topic(
+    brokers: &str,
+    topic: &str,
+    num_partitions: usize,
+) -> Result<(), ChironKafkaError> {
+    let admin: AdminClient<_> = ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .create()
+        .map_err(ChironKafkaError::Kafka)?;
+
+    let spec = NewTopic::new(topic, num_partitions as i32, TopicReplication::Fixed(1));
+    let opts = AdminOptions::new()
+        .request_timeout(Some(Duration::from_secs(10)))
+        .operation_timeout(Some(Duration::from_secs(10)));
+
+    let results = block_on(admin.create_topics([&spec], &opts)).map_err(ChironKafkaError::Kafka)?;
+
+    for result in results {
+        match result {
+            Ok(_) => {}
+            Err((_topic_name, RDKafkaErrorCode::TopicAlreadyExists)) => {}
+            Err((_topic_name, code)) => {
+                return Err(ChironKafkaError::Kafka(KafkaError::AdminOp(code)));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Kafka producer that sends LogEntry records as JSON to a topic.

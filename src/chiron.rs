@@ -436,6 +436,11 @@ impl ChironStore {
         self.shards.read().unwrap().len()
     }
 
+    /// Returns the number of live entries in each shard, indexed by shard position.
+    pub fn shard_lens(&self) -> Vec<usize> {
+        self.shard_handles().iter().map(|s| s.len()).collect()
+    }
+
     pub fn save_snapshot(&self, path: &Path, kafka_offsets: &KafkaOffsets) -> io::Result<()> {
         let shards: Vec<_> = self
             .shard_handles()
