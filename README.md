@@ -163,13 +163,9 @@ Recovery does the following:
 3. Restore Kafka offsets from the snapshot.
 4. Resume consumers from those offsets and replay forward.
 
-### Live Snapshot Coordination
+### Snapshot Consistency
 
-`ChironStore::save_snapshot_with_offsets` now pauses ingest behind a store-level snapshot gate, captures Kafka offsets through a caller-provided closure, and clones each shard from a single read lock before writes resume.
-
-That gives live snapshots a consistent "offsets + in-memory entries" cut, as long as the caller captures offsets inside that closure.
-
-`save_snapshot` still exists as a convenience for offline or already-coordinated callers that have offsets in hand already, but the live path should prefer `save_snapshot_with_offsets`.
+`save_snapshot` clones each shard under its own per-shard read lock, so individual shards are internally consistent (no torn `next_offset` / entries). No global ingest pause is required — Kafka offsets provide the consistency boundary on restore, and any entries ingested between shard captures are simply replayed from those offsets.
 
 ## File Structure
 

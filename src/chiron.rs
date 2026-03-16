@@ -18,7 +18,6 @@ use crate::snapshot::{KafkaOffsets, RestoredShard, Snapshot, SnapshotShard};
 pub struct ChironStore {
     shards: Vec<Arc<PartitionShard>>,
     total_capacity: usize,
-    snapshot_gate: RwLock<()>,
 }
 
 struct PartitionShard {
@@ -328,20 +327,17 @@ impl ChironStore {
         Self {
             shards,
             total_capacity,
-            snapshot_gate: RwLock::new(()),
         }
     }
 
     /// Append using the store's host-based sharding strategy.
     pub fn ingest(&self, entry: LogEntry) -> u64 {
-        let _snapshot_guard = self.snapshot_gate.read().unwrap();
         let shard = self.shard_for_host(&entry.host_id);
         shard.ingest_capped(entry.into())
     }
 
     /// Append directly into the shard that corresponds to a Kafka partition.
     pub fn ingest_partition(&self, partition_id: u32, entry: LogEntry) -> u64 {
-        let _snapshot_guard = self.snapshot_gate.read().unwrap();
         let shard = self.shard_by_id(partition_id).unwrap_or_else(|| {
             panic!(
                 "partition id {partition_id} exceeds configured shard count {}",
@@ -353,7 +349,6 @@ impl ChironStore {
 
     /// Append a batch directly into the shard that corresponds to a Kafka partition.
     pub fn ingest_partition_batch(&self, partition_id: u32, entries: Vec<LogEntry>) -> usize {
-        let _snapshot_guard = self.snapshot_gate.read().unwrap();
         if entries.is_empty() {
             return 0;
         }
@@ -435,32 +430,17 @@ impl ChironStore {
         self.shard_handles().iter().map(|s| s.len()).collect()
     }
 
-    /// Save a snapshot using offsets that were already captured by the caller.
-    ///
-    /// For live pipelines, prefer `save_snapshot_with_offsets` so offset capture
-    /// and shard serialization happen while ingest is paused by the same gate.
+    /// Save a snapshot. Each shard is cloned under its own read lock, so
+    /// individual shards are self-consistent. No global ingest pause is
+    /// required — Kafka offsets provide the consistency boundary on restore.
     pub fn save_snapshot(&self, path: &Path, kafka_offsets: &KafkaOffsets) -> io::Result<()> {
-        self.save_snapshot_with_offsets(path, || Ok(kafka_offsets.clone()))
-    }
+        let shards: Vec<_> = self
+            .shards
+            .iter()
+            .map(|shard| shard.snapshot_shard())
+            .collect();
 
-    /// Pause ingest long enough to capture caller-supplied Kafka offsets and a
-    /// shard-consistent in-memory snapshot from the same point in time.
-    pub fn save_snapshot_with_offsets<F>(&self, path: &Path, capture_offsets: F) -> io::Result<()>
-    where
-        F: FnOnce() -> io::Result<KafkaOffsets>,
-    {
-        let (shards, kafka_offsets) = {
-            let _snapshot_guard = self.snapshot_gate.write().unwrap();
-            let kafka_offsets = capture_offsets()?;
-            let shards: Vec<_> = self
-                .shards
-                .iter()
-                .map(|shard| shard.snapshot_shard())
-                .collect();
-            (shards, kafka_offsets)
-        };
-
-        Snapshot::save_sharded(path, &shards, &kafka_offsets)
+        Snapshot::save_sharded(path, &shards, kafka_offsets)
     }
 
     pub fn from_snapshot(path: &Path) -> io::Result<(Self, KafkaOffsets)> {
@@ -482,7 +462,6 @@ impl ChironStore {
         let store = Self {
             shards,
             total_capacity,
-            snapshot_gate: RwLock::new(()),
         };
 
         Ok((store, kafka_offsets))
@@ -518,10 +497,7 @@ fn sort_entries(entries: &mut [SharedLogEntry]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Barrier};
-    use std::thread;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn make_entry(ts: i64, svc: &str, host: &str) -> LogEntry {
         LogEntry {
@@ -784,9 +760,7 @@ mod tests {
         offsets.set("logs", 0, 99999);
         offsets.set("logs", 1, 88888);
 
-        store
-            .save_snapshot_with_offsets(&path, || Ok(offsets.clone()))
-            .unwrap();
+        store.save_snapshot(&path, &offsets).unwrap();
 
         let (restored, restored_offsets) = ChironStore::from_snapshot(&path).unwrap();
         assert_eq!(restored.len(), 3);
@@ -803,56 +777,6 @@ mod tests {
         assert_eq!(restored.shard_count(), 3);
         assert_eq!(restored_offsets.get("logs", 0), Some(99999));
         assert_eq!(restored_offsets.get("logs", 1), Some(88888));
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn live_snapshot_with_offsets_excludes_blocked_ingest() {
-        let dir = unique_test_dir("chiron_test_live_snapshot");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("store.snap");
-
-        let store = Arc::new(ChironStore::new(10));
-        store.ingest(make_entry(10, "auth", "h1"));
-
-        let started = Arc::new(Barrier::new(2));
-        let ingest_finished = Arc::new(AtomicBool::new(false));
-        let writer_store = Arc::clone(&store);
-        let writer_started = Arc::clone(&started);
-        let writer_finished = Arc::clone(&ingest_finished);
-
-        let handle = thread::spawn(move || {
-            writer_started.wait();
-            writer_store.ingest(make_entry(20, "auth", "h1"));
-            writer_finished.store(true, Ordering::SeqCst);
-        });
-
-        let mut offsets = KafkaOffsets::new();
-        offsets.set("logs", 0, 12345);
-
-        store
-            .save_snapshot_with_offsets(&path, || {
-                started.wait();
-                thread::sleep(Duration::from_millis(50));
-                assert!(
-                    !ingest_finished.load(Ordering::SeqCst),
-                    "ingest should stay blocked until snapshot capture finishes"
-                );
-                Ok(offsets.clone())
-            })
-            .unwrap();
-
-        handle.join().unwrap();
-
-        let live_result = store.query_by_host("h1", 0, i64::MAX);
-        assert_eq!(live_result.entries.len(), 2);
-
-        let (restored, restored_offsets) = ChironStore::from_snapshot(&path).unwrap();
-        let snapshot_result = restored.query_by_host("h1", 0, i64::MAX);
-        assert_eq!(snapshot_result.entries.len(), 1);
-        assert_eq!(snapshot_result.entries[0].timestamp, 10);
-        assert_eq!(restored_offsets.get("logs", 0), Some(12345));
 
         std::fs::remove_dir_all(&dir).ok();
     }
