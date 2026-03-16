@@ -29,10 +29,10 @@ The store is shard-aware end-to-end now, but a few control-plane pieces are stil
 - records are routed to partition-local shards
 - shard buffers and indexes sit behind per-shard locks
 - host-scoped queries use deterministic `partition_for_host(...)` routing instead of a mutable routing table
-- eviction is shard-local in effect, but still triggered against a store-level occupancy budget
-- snapshot orchestration and some capacity bookkeeping remain store-scoped
+- admission and eviction are enforced shard-locally with a fixed capacity per shard
+- snapshot orchestration and cross-shard query fanout remain store-scoped
 
-So the hot data path is shard-local, while a small amount of lifecycle and capacity coordination still lives at the store level.
+So the hot data path is shard-local, while only lifecycle orchestration and broad query fanout still live at the store level.
 
 ### TODO: Stable Host→Partition Assignment
 
@@ -111,24 +111,22 @@ That result shape is best treated as an internal-performance API. If you want a 
 
 ## Capacity Model
 
-The current store still admits writes against one store-level budget, but it carries shard-level capacity metadata too.
+Capacity is enforced as a hard per-shard quota.
 
 - `with_shards(total_capacity, shard_count)` requires uniform per-shard capacity, so `total_capacity` must be divisible by `shard_count`
+- each shard gets `total_capacity / shard_count` slots
+- global capacity is just the sum of those shard-local capacities
 - those shard capacities are persisted in snapshots and reconstructed on restore
-- runtime admission is still checked against the store-wide occupancy, not against a hard per-shard quota
-- that means hot shards can temporarily consume more of the live dataset until eviction runs
 
-This is why the code still has both shard-local state and a top-level notion of total occupancy: the layout is shard-based, but admission control has not been fully pushed down to independent shard budgets.
+This means a hot shard can only overwrite its own history; spare room in quieter shards is not borrowed implicitly.
 
 ## Eviction
 
-Eviction remains **oldest-first within a shard**, but it is now biased toward the shard creating the pressure.
+Eviction is **oldest-first within a shard**.
 
-When a write arrives and the store is already full, the target shard evicts its own oldest entry first. That means a noisy host mostly overwrites its own older history instead of displacing quieter hosts.
+When a write arrives for a shard that is already at capacity, that shard evicts its own oldest entry before appending the new one. A noisy host therefore mostly overwrites its own older history instead of displacing quieter hosts.
 
-If the target shard cannot shed data, the store falls back to trimming the fullest shard. Background maintenance follows the same bias: it repeatedly trims the fullest shard first instead of comparing timestamps globally across all shards.
-
-This retention policy is intentionally different from "keep the newest cluster-wide data at all costs." It favors host isolation over perfect global recency.
+This retention policy intentionally favors host isolation over perfect cluster-wide recency.
 
 ## Durability: Kafka Replay + Sharded Snapshots
 

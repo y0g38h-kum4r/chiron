@@ -179,4 +179,3 @@ fn join_thread_result<T>(
         .join()
         .map_err(|_| ChironKafkaError::ThreadPanic("worker thread panicked"))?
 }
-

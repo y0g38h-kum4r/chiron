@@ -1,8 +1,7 @@
 use std::collections::VecDeque;
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 
 use crate::partition_for_host;
 
@@ -13,16 +12,12 @@ use crate::snapshot::{KafkaOffsets, RestoredShard, Snapshot, SnapshotShard};
 /// Partition-local Chiron store.
 ///
 /// Each shard owns its own append buffer and indexes so Kafka partition traffic
-/// can be routed into independent hot paths. The total number of live entries
-/// is still governed by a single global budget on the store, but when a hot
-/// shard causes capacity pressure it preferentially sheds its own oldest data
-/// before displacing quieter shards.
+/// can be routed into independent hot paths. Capacity is enforced shard-locally:
+/// a hot shard overwrites only its own oldest data and never borrows space from
+/// quieter shards.
 pub struct ChironStore {
-    shards: RwLock<Vec<Arc<PartitionShard>>>,
+    shards: Vec<Arc<PartitionShard>>,
     total_capacity: usize,
-    live_len: AtomicUsize,
-    shard_admin: Mutex<()>,
-    capacity_admin: Mutex<()>,
 }
 
 struct PartitionShard {
@@ -208,6 +203,14 @@ impl PartitionShardState {
         self.buffer.len()
     }
 
+    fn make_room_for(&mut self, additional_entries: usize, capacity: usize) {
+        let required = self.len().saturating_add(additional_entries);
+        let to_evict = required.saturating_sub(capacity);
+        if to_evict > 0 {
+            self.evict_head(to_evict);
+        }
+    }
+
     fn evict_head(&mut self, count: usize) -> usize {
         let evicted = self.buffer.evict_head(count);
         if evicted == 0 {
@@ -241,11 +244,13 @@ impl PartitionShard {
         })
     }
 
-    fn ingest(&self, entry: SharedLogEntry) -> u64 {
-        self.inner.write().unwrap().ingest(entry)
+    fn ingest_capped(&self, entry: SharedLogEntry) -> u64 {
+        let mut inner = self.inner.write().unwrap();
+        inner.make_room_for(1, self.capacity);
+        inner.ingest(entry)
     }
 
-    fn ingest_batch(&self, entries: Vec<SharedLogEntry>) -> usize {
+    fn ingest_batch_capped(&self, entries: Vec<SharedLogEntry>) -> usize {
         let len = entries.len();
         if len == 0 {
             return 0;
@@ -253,6 +258,7 @@ impl PartitionShard {
 
         let mut inner = self.inner.write().unwrap();
         for entry in entries {
+            inner.make_room_for(1, self.capacity);
             inner.ingest(entry);
         }
 
@@ -288,10 +294,6 @@ impl PartitionShard {
         self.capacity
     }
 
-    fn evict_head(&self, count: usize) -> usize {
-        self.inner.write().unwrap().evict_head(count)
-    }
-
     fn entries_owned(&self) -> Vec<LogEntry> {
         self.inner.read().unwrap().buffer.entries_owned()
     }
@@ -317,26 +319,26 @@ impl ChironStore {
             .collect();
 
         Self {
-            shards: RwLock::new(shards),
+            shards,
             total_capacity,
-            live_len: AtomicUsize::new(0),
-            shard_admin: Mutex::new(()),
-            capacity_admin: Mutex::new(()),
         }
     }
 
     /// Append using the store's host-based sharding strategy.
     pub fn ingest(&self, entry: LogEntry) -> u64 {
         let shard = self.shard_for_host(&entry.host_id);
-        self.reserve_slot_for_shard(&shard);
-        shard.ingest(entry.into())
+        shard.ingest_capped(entry.into())
     }
 
     /// Append directly into the shard that corresponds to a Kafka partition.
     pub fn ingest_partition(&self, partition_id: u32, entry: LogEntry) -> u64 {
-        let shard = self.ensure_shard(partition_id);
-        self.reserve_slot_for_shard(&shard);
-        shard.ingest(entry.into())
+        let shard = self.shard_by_id(partition_id).unwrap_or_else(|| {
+            panic!(
+                "partition id {partition_id} exceeds configured shard count {}",
+                self.shard_count()
+            )
+        });
+        shard.ingest_capped(entry.into())
     }
 
     /// Append a batch directly into the shard that corresponds to a Kafka partition.
@@ -345,15 +347,19 @@ impl ChironStore {
             return 0;
         }
 
-        let shard = self.ensure_shard(partition_id);
+        let shard = self.shard_by_id(partition_id).unwrap_or_else(|| {
+            panic!(
+                "partition id {partition_id} exceeds configured shard count {}",
+                self.shard_count()
+            )
+        });
         let mut shared_entries = Vec::with_capacity(entries.len());
 
         for entry in entries {
-            self.reserve_slot_for_shard(&shard);
             shared_entries.push(entry.into());
         }
 
-        shard.ingest_batch(shared_entries)
+        shard.ingest_batch_capped(shared_entries)
     }
 
     /// Compatibility no-op: entries are indexed during ingest and restored
@@ -398,7 +404,7 @@ impl ChironStore {
     }
 
     pub fn len(&self) -> usize {
-        self.live_len.load(Ordering::Acquire)
+        self.live_len_from_shards()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -410,7 +416,7 @@ impl ChironStore {
     }
 
     pub fn shard_count(&self) -> usize {
-        self.shards.read().unwrap().len()
+        self.shards.len()
     }
 
     /// Returns the number of live entries in each shard, indexed by shard position.
@@ -448,121 +454,31 @@ impl ChironStore {
         }
         shards.sort_by_key(|shard| shard.shard_id);
 
-        let live_len = shards.iter().map(|shard| shard.len()).sum();
         let total_capacity = shards.iter().map(|shard| shard.capacity()).sum();
         let store = Self {
-            shards: RwLock::new(shards),
+            shards,
             total_capacity,
-            live_len: AtomicUsize::new(live_len),
-            shard_admin: Mutex::new(()),
-            capacity_admin: Mutex::new(()),
         };
 
         Ok((store, kafka_offsets))
-    }
-
-    fn reserve_slot_for_shard(&self, target_shard: &Arc<PartitionShard>) {
-        loop {
-            let current = self.live_len.load(Ordering::Acquire);
-            if current < self.total_capacity {
-                if self
-                    .live_len
-                    .compare_exchange_weak(
-                        current,
-                        current + 1,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_ok()
-                {
-                    return;
-                }
-                continue;
-            }
-
-            let _guard = self.capacity_admin.lock().unwrap();
-            if self.live_len.load(Ordering::Acquire) < self.total_capacity {
-                continue;
-            }
-
-            // TODO: Batch eviction — evict e.g. 1% of shard capacity at once
-            // instead of 1 entry at a time. Each evict_head triggers a full
-            // InvertedIndex::purge_below scan (O(K * log N) over all keys),
-            // so batching amortizes that cost and avoids latency spikes under
-            // high-cardinality dimensions (ephemeral hosts/services).
-            let evicted = if target_shard.len() > 0 {
-                target_shard.evict_head(1)
-            } else {
-                // If the target shard is empty, fall back to trimming the
-                // fullest shard so the new write can still be admitted.
-                self.evict_fullest_shard(1)
-            };
-
-            if evicted == 0 {
-                self.live_len
-                    .store(self.live_len_from_shards(), Ordering::Release);
-                continue;
-            }
-
-            self.live_len.fetch_sub(evicted, Ordering::AcqRel);
-        }
-    }
-
-    fn evict_fullest_shard(&self, count: usize) -> usize {
-        let Some(shard) = self
-            .shard_handles()
-            .iter()
-            .filter(|shard| shard.len() > 0)
-            .max_by_key(|shard| shard.len())
-            .cloned()
-        else {
-            return 0;
-        };
-
-        shard.evict_head(count)
     }
 
     /// Deterministic host→shard routing. Uses the shared `partition_for_host`
     /// function so producers and the store always agree on shard placement.
     fn shard_for_host(&self, host: &str) -> Arc<PartitionShard> {
         let pos = partition_for_host(host, self.shard_count());
-        self.shards.read().unwrap()[pos].clone()
+        self.shards[pos].clone()
     }
 
     fn shard_handles(&self) -> Vec<Arc<PartitionShard>> {
-        self.shards.read().unwrap().iter().cloned().collect()
+        self.shards.clone()
     }
 
     fn shard_by_id(&self, shard_id: u32) -> Option<Arc<PartitionShard>> {
         self.shards
-            .read()
-            .unwrap()
             .iter()
             .find(|shard| shard.shard_id == shard_id)
             .cloned()
-    }
-
-    fn ensure_shard(&self, shard_id: u32) -> Arc<PartitionShard> {
-        if let Some(shard) = self.shard_by_id(shard_id) {
-            return shard;
-        }
-
-        let _guard = self.shard_admin.lock().unwrap();
-        if let Some(shard) = self.shard_by_id(shard_id) {
-            return shard;
-        }
-
-        let mut shards = self.shards.write().unwrap();
-        let start = shards.len() as u32;
-        for id in start..=shard_id {
-            shards.push(Arc::new(PartitionShard::new(id, 0)));
-        }
-
-        shards
-            .iter()
-            .find(|shard| shard.shard_id == shard_id)
-            .cloned()
-            .expect("newly created shard must exist")
     }
 
     fn live_len_from_shards(&self) -> usize {
@@ -775,20 +691,21 @@ mod tests {
     fn hot_shard_evicts_own_entries_under_pressure() {
         let store = ChironStore::with_shards(12, 4);
         let p = part("hot-host", 4);
-        // Fill all 12 slots into one shard.
-        for ts in 0..12 {
+        // Per-shard capacity is 3, so a hot shard cannot borrow from the
+        // three quieter shards even though the global capacity is 12.
+        for ts in 0..3 {
             store.ingest_partition(p, make_entry(ts, "svc", "hot-host"));
         }
-        assert_eq!(store.len(), 12);
+        assert_eq!(store.len(), 3);
 
-        // 13th entry forces eviction from the writing shard.
-        store.ingest_partition(p, make_entry(12, "svc", "hot-host"));
-        assert_eq!(store.len(), 12);
+        // The next entry evicts only from the writing shard.
+        store.ingest_partition(p, make_entry(3, "svc", "hot-host"));
+        assert_eq!(store.len(), 3);
 
         let result = store.query_by_service("svc", 0, i64::MAX);
-        assert_eq!(result.entries.len(), 12);
+        assert_eq!(result.entries.len(), 3);
         assert_eq!(result.entries.first().unwrap().timestamp, 1);
-        assert_eq!(result.entries.last().unwrap().timestamp, 12);
+        assert_eq!(result.entries.last().unwrap().timestamp, 3);
         assert_nondecreasing_timestamps(&result.entries);
     }
 

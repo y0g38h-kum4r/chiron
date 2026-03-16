@@ -339,4 +339,3 @@ fn main() {
     );
     println!("e2e_bench: consumer_errors={consumer_errors}");
 }
-

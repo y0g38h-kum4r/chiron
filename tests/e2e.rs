@@ -752,12 +752,12 @@ fn kafka_sharded_store_roundtrip() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 10: Sharded eviction keeps the newest global data
+// Test 10: Balanced sharded writes stay within shard-local capacity
 // ---------------------------------------------------------------------------
 
 #[test]
 #[ignore]
-fn kafka_sharded_eviction_keeps_newest_global_entries() {
+fn kafka_sharded_balanced_writes_preserve_all_entries() {
     if !require_kafka() {
         return;
     }
@@ -765,12 +765,12 @@ fn kafka_sharded_eviction_keeps_newest_global_entries() {
     let topic = unique_topic("e2e-sharded-evict");
     let group = format!("{}-group", topic);
 
-    // Four hosts spread the writes across keyed Kafka partitions while timestamps
-    // stay globally ordered, which lets us verify global oldest-first eviction.
+    // Four hosts that hash to four distinct partitions, so writes are spread
+    // evenly and per-shard capacity (12/4 = 3) is never exceeded.
+    let hosts = ["host-00", "host-02", "host-03", "host-06"];
     let mut entries = Vec::new();
     for i in 0..12 {
-        let host = format!("h{}", i % 4);
-        entries.push(entry(i, "svc", &host));
+        entries.push(entry(i, "svc", hosts[i as usize % 4]));
     }
 
     let (store, consumed) = produce_and_consume_sharded(&topic, &group, &entries, 12, 4).unwrap();
