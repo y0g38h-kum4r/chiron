@@ -8,6 +8,7 @@ An in-memory, Kafka-backed log store for incident-style queries over recent obse
 2. **Host-scoped queries are the primary query paths.** `ByHost` is the hottest path, `ByServiceAndHost` is the next most common narrowing query, and `ByService` is a broader fleet-wide query that can afford fanout.
 3. **Abnormally noisy hosts are expected to be handled upstream.** If a host starts emitting an unusual amount of data, we assume an external alerting or signal-management service will detect and manage that condition. Locally, retention still prefers to shed that shard's own older data instead of pushing out quieter shards.
 4. **Freshness on the live path matters.** Newly ingested records are indexed inline so accepted records are queryable immediately instead of waiting on a background flush tick.
+5. **Service and host identities are dictionary-friendly.** We expect `service_name` and `host_id` to be representable as interned ids such as `u32` on the hot path, so the store should prefer shared references or ids over cloning owned strings per record. If a protobuf or other RPC boundary exists, that boundary is responsible for translating those internal ids/references back into stable external string fields.
 
 ## Architecture: Partition-Local Shards
 
@@ -107,7 +108,7 @@ the same timestamp may appear in any relative order.
 
 `QueryResult` returns `Vec<SharedLogEntry>` on purpose. That keeps the hot path zero-copy and avoids re-allocating `service_name`, `host_id`, and `message` strings for every match.
 
-That result shape is best treated as an internal-performance API. If you want a stable external contract, convert to owned `LogEntry` values or protobuf/gRPC response messages at the service boundary instead of freezing `SharedLogEntry` into the public surface area.
+Today the implementation uses `Arc<str>` for shared string storage, but the intended direction is compatible with interning `service_name` and `host_id` down to compact ids such as `u32`. If that change is made, Chiron should continue treating those ids as an internal-performance representation and rely on the protobuf or RPC boundary to materialize the external string form.
 
 ## Capacity Model
 
