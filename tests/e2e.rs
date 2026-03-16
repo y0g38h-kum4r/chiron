@@ -192,15 +192,8 @@ fn kafka_full_lifecycle() {
         "all entries should be consumed from Kafka"
     );
 
-    // Before flushing — queries return nothing.
-    assert!(
-        store
-            .query_by_service("auth", 0, i64::MAX)
-            .entries
-            .is_empty()
-    );
-
-    // Flush indexer.
+    // Ingest indexes entries inline, so flushing is a no-op here,
+    // but call it for symmetry and to assert zero lag.
     store.flush_indexer();
     assert_eq!(store.indexer_lag(), 0);
 
